@@ -75,6 +75,42 @@ class PyLavYouTubeRadio(DISCORD_COG_TYPE_MIXIN):
     # Seed resolution
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _extract_tracks(response: Any) -> list[Any]:
+        """Pull the track list out of a loadtracks response.
+
+        PyLav's response objects changed shape between Lavalink v3 and v4:
+
+          v3: TrackLoaded / PlaylistLoaded / SearchResult, all with .tracks
+          v4: TrackResponse / PlaylistResponse / SearchResponse, where the
+              payload lives under .data -- a list for searches, an object
+              with .tracks for playlists, a bare track for single loads.
+
+        This handles both so the cog doesn't break on a PyLav update.
+        """
+        if not response:
+            return []
+
+        # v3 shape, and v4 responses that still expose a flat list.
+        tracks = getattr(response, "tracks", None)
+        if tracks:
+            return list(tracks)
+
+        data = getattr(response, "data", None)
+        if data is None:
+            return []
+        if isinstance(data, list):
+            return list(data)
+
+        nested = getattr(data, "tracks", None)
+        if nested:
+            return list(nested)
+
+        # Single track load: data is the track itself.
+        if getattr(data, "encoded", None) or getattr(data, "info", None):
+            return [data]
+        return []
+
     async def _youtube_id_for(self, track: Track) -> str | None:
         """Return a YouTube video ID to seed the mix from.
 
@@ -104,13 +140,14 @@ class PyLavYouTubeRadio(DISCORD_COG_TYPE_MIXIN):
         # the branch is `fullsearch and is_search or is_single`, and a
         # search query is not is_single, so False here returns nothing.
         response = await self.pylav.get_tracks(query, fullsearch=True)
-        if not response or not response.tracks:
+        results = self._extract_tracks(response)
+        if not results:
             LOGGER.debug("No YouTube match found for %s", terms)
             return None
 
         candidate = await Track.build_track(
             node=await self.pylav.node_manager.find_best_node(),
-            data=response.tracks[0],
+            data=results[0],
             query=None,
             requester=self.bot.user.id,
         )
@@ -123,9 +160,14 @@ class PyLavYouTubeRadio(DISCORD_COG_TYPE_MIXIN):
         url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
         query = await Query.from_string(url)
         response = await self.pylav.get_tracks(query, player=player)
-        if not response or not response.tracks:
-            return []
-        return list(response.tracks)
+        tracks = self._extract_tracks(response)
+        if not tracks:
+            LOGGER.debug(
+                "Mix RD%s returned no usable tracks (response type: %s)",
+                video_id,
+                type(response).__name__,
+            )
+        return tracks
 
     # ------------------------------------------------------------------
     # The actual hook
