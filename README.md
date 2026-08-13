@@ -42,11 +42,6 @@ PyLavYouTubeRadio commands
 > [p]ytradio toggle true
 > ```
 
-> **Warning**
-> This cog is not in the PyLav-Cogs repo, so `[p]cog install` will not find it.
-> Place the `plytradio` folder in a path registered with `[p]addpath`, then `[p]load plytradio`.
-
-
 Documentation
 ---------------------------
 
