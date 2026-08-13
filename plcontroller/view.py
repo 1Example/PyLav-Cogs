@@ -22,6 +22,67 @@ _ = Translator("PyLavController", Path(__file__))
 # the whole controller.
 TRANSPARENT = discord.ButtonStyle.secondary
 
+# How long the queue menu stays open with no interaction before it deletes
+# itself. PyLav's default is 600s, which leaves a large panel sitting above
+# the controller for ten minutes.
+QUEUE_MENU_TIMEOUT = 60
+
+# How long the ephemeral "I have skipped ..." style confirmations stay before
+# they are removed.
+EPHEMERAL_DELETE_AFTER = 5
+
+# Queue-menu buttons that reply with an ephemeral confirmation. These all
+# defer with thinking=True, so their response is safe to delete. Navigation
+# buttons are deliberately excluded -- they defer against the menu message
+# itself, and deleting their response would delete the menu.
+CONFIRMING_BUTTONS = frozenset(
+    {
+        "PreviousTrackButton",
+        "StopTrackButton",
+        "PauseTrackButton",
+        "ResumeTrackButton",
+        "SkipTrackButton",
+        "IncreaseVolumeButton",
+        "DecreaseVolumeButton",
+        "ToggleRepeatButton",
+        "ToggleRepeatQueueButton",
+        "ShuffleButton",
+        "DisconnectButton",
+        "EmptyQueueButton",
+        "RemoveFromQueueButton",
+        "PlayNowFromQueueButton",
+    }
+)
+
+
+class AutoDeletingFollowup:
+    """Wraps ``interaction.followup`` so ephemeral replies clean themselves up.
+
+    Red sends command responses through ``interaction.followup.send``. We
+    cannot patch the Webhook itself (it uses ``__slots__``), but
+    ``Interaction.followup`` is a cached-slot property, so swapping the
+    cached value for this proxy lets us schedule a delete on anything sent
+    while a button callback is running.
+    """
+
+    __slots__ = ("_webhook", "_delay")
+
+    def __init__(self, webhook, delay: float):
+        self._webhook = webhook
+        self._delay = delay
+
+    def __getattr__(self, item):
+        return getattr(self._webhook, item)
+
+    async def send(self, *args, **kwargs):
+        kwargs.setdefault("wait", True)
+        message = await self._webhook.send(*args, **kwargs)
+        if message is not None:
+            with contextlib.suppress(Exception):
+                # delay= schedules a background task and returns immediately.
+                await message.delete(delay=self._delay)
+        return message
+
 
 if TYPE_CHECKING:
     from plcontroller.cog import PyLavController
@@ -196,6 +257,13 @@ class QueueHistoryButton(discord.ui.Button):
         ).start(ctx=context)
 
 
+async def delete_response_later(interaction, delay: float) -> None:
+    """Delete an interaction's original response after ``delay`` seconds."""
+    await asyncio.sleep(delay)
+    with contextlib.suppress(Exception):
+        await interaction.delete_original_response()
+
+
 _CONTROLLER_QUEUE_MENU = None
 
 
@@ -228,6 +296,8 @@ def get_controller_queue_menu():
         """QueueMenu with the controller's transparent styling and grouping."""
 
         def __init__(self, *args, **kwargs):
+            kwargs.setdefault("timeout", QUEUE_MENU_TIMEOUT)
+            kwargs.setdefault("delete_after_timeout", True)
             super().__init__(*args, **kwargs)
 
             # Every button transparent, same as the controller panel.
@@ -265,6 +335,35 @@ def get_controller_queue_menu():
                 (self.queue_disconnect, 3),
             ):
                 button.row = row
+
+            for attribute in vars(self).values():
+                if isinstance(attribute, discord.ui.Button):
+                    self._wrap_for_auto_delete(attribute)
+
+        @staticmethod
+        def _wrap_for_auto_delete(button: discord.ui.Button) -> None:
+            """Make a button's ephemeral confirmation delete itself shortly after."""
+            if type(button).__name__ not in CONFIRMING_BUTTONS:
+                return
+            original = button.callback
+            if getattr(original, "__plc_wrapped__", False):
+                return
+
+            async def wrapped(interaction, *, _original=original):
+                real_followup = interaction.followup
+                with contextlib.suppress(Exception):
+                    interaction._cs_followup = AutoDeletingFollowup(real_followup, EPHEMERAL_DELETE_AFTER)
+                try:
+                    await _original(interaction)
+                finally:
+                    with contextlib.suppress(Exception):
+                        interaction._cs_followup = real_followup
+                    # If the reply landed on the original deferred response
+                    # rather than a followup, clear that too.
+                    asyncio.create_task(delete_response_later(interaction, EPHEMERAL_DELETE_AFTER))
+
+            wrapped.__plc_wrapped__ = True
+            button.callback = wrapped
 
         def _display_order(self) -> list:
             """Left-to-right order within each row, mirroring the panel."""
