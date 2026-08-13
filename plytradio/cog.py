@@ -100,7 +100,10 @@ class PyLavYouTubeRadio(DISCORD_COG_TYPE_MIXIN):
             return None
 
         query = await Query.from_string(f"ytsearch:{terms}")
-        response = await self.pylav.get_tracks(query, fullsearch=False)
+        # get_tracks drops search results unless fullsearch is True --
+        # the branch is `fullsearch and is_search or is_single`, and a
+        # search query is not is_single, so False here returns nothing.
+        response = await self.pylav.get_tracks(query, fullsearch=True)
         if not response or not response.tracks:
             LOGGER.debug("No YouTube match found for %s", terms)
             return None
@@ -136,17 +139,24 @@ class PyLavYouTubeRadio(DISCORD_COG_TYPE_MIXIN):
         guild_id = player.guild.id
 
         if event.reason not in NATURAL_END_REASONS:
+            LOGGER.debug("Track ended in guild %s with reason %s - ignoring", guild_id, event.reason)
             return
         if not await self.is_enabled(guild_id):
             return
+        LOGGER.debug("Radio hook fired in guild %s", guild_id)
 
         async with self._lock[guild_id]:
             # PyLav has already run next() by the time this fires. If
             # something is playing or queued, the queue wasn't actually
             # empty and we should stay out of the way.
             if player.current is not None or not player.queue.empty():
+                LOGGER.debug(
+                    "Guild %s: something already playing or queued - built-in autoplay may be on",
+                    guild_id,
+                )
                 return
             if not player.is_connected:
+                LOGGER.debug("Guild %s: player disconnected before radio could load", guild_id)
                 return
 
             seed_track = event.track
@@ -252,6 +262,91 @@ class PyLavYouTubeRadio(DISCORD_COG_TYPE_MIXIN):
         await context.send(
             embed=await self.pylav.construct_embed(
                 description=_("I will queue {number} recommended tracks at a time.").format(number=size),
+                messageable=context,
+            ),
+            ephemeral=True,
+        )
+
+    @command_ytradio.command(name="diagnose", aliases=["test"])
+    @commands.admin_or_permissions(manage_guild=True)
+    async def command_ytradio_diagnose(self, context: PyLavContext) -> None:
+        """Walk the radio pipeline against the current track and report each step."""
+        if isinstance(context, discord.Interaction):
+            context = await self.bot.get_context(context)
+        if context.interaction and not context.interaction.response.is_done():
+            await context.defer(ephemeral=True)
+
+        lines: list[str] = []
+        guild_id = context.guild.id
+
+        enabled = await self.is_enabled(guild_id)
+        lines.append(f"{'PASS' if enabled else 'FAIL'} - radio enabled: {enabled}")
+
+        player: Player | None = self.pylav.get_player(guild_id)
+        if player is None:
+            lines.append("FAIL - no player. Play something first, then run this.")
+            await self._send_diagnosis(context, lines)
+            return
+        lines.append("PASS - player exists")
+
+        builtin = False
+        with contextlib.suppress(Exception):
+            builtin = await player.autoplay_enabled()
+        if builtin:
+            lines.append("FAIL - PyLav autoplay is ON and will pre-empt the radio.")
+            lines.append("       Run: [p]playerset server auto false")
+        else:
+            lines.append("PASS - PyLav built-in autoplay is off")
+
+        with contextlib.suppress(Exception):
+            dc = await player.config.fetch_empty_queue_dc()
+            if getattr(dc, "enabled", False):
+                lines.append("WARN - empty-queue disconnect is on; bot may leave before the radio loads.")
+
+        seed = player.current or player.last_track
+        if seed is None:
+            lines.append("FAIL - nothing playing and no last track to seed from.")
+            await self._send_diagnosis(context, lines)
+            return
+
+        with contextlib.suppress(Exception):
+            lines.append(f"PASS - seed track: {await seed.title()}")
+
+        with contextlib.suppress(Exception):
+            if await seed.stream():
+                lines.append("WARN - seed is a livestream. Streams never end, so the")
+                lines.append("       radio hook will never fire while one is playing.")
+
+        video_id = await self._youtube_id_for(seed)
+        if not video_id:
+            lines.append("FAIL - could not resolve a YouTube video ID for the seed.")
+            await self._send_diagnosis(context, lines)
+            return
+        lines.append(f"PASS - resolved video ID: {video_id}")
+
+        tracks = await self._fetch_mix(video_id, player)
+        if not tracks:
+            lines.append(f"FAIL - mix RD{video_id} returned no tracks.")
+            lines.append("       Your Lavalink node's YouTube source may be broken,")
+            lines.append("       or this video has no mix available.")
+            await self._send_diagnosis(context, lines)
+            return
+        lines.append(f"PASS - mix returned {len(tracks)} tracks")
+
+        already = len(self._played[guild_id])
+        lines.append(f"INFO - {already} tracks in this guild's radio memory")
+        lines.append("")
+        lines.append("Pipeline works. If playback still stops, the listener isn't")
+        lines.append("firing - check that track end reason is FINISHED, not STOPPED.")
+
+        await self._send_diagnosis(context, lines)
+
+    async def _send_diagnosis(self, context: PyLavContext, lines: list[str]) -> None:
+        body = "\n".join(lines)
+        await context.send(
+            embed=await self.pylav.construct_embed(
+                title=_("YouTube radio diagnostics"),
+                description=f"```\n{body}\n```",
                 messageable=context,
             ),
             ephemeral=True,
