@@ -300,7 +300,7 @@ class RefreshButton(discord.ui.Button):
     def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
         super().__init__(
             style=style,
-            emoji="\N{ANTICLOCKWISE DOWNWARDS AND UPWARDS OPEN CIRCLE ARROWS}",
+            emoji=emojis.UPDATE,
             row=row,
             custom_id=custom_id,
         )
@@ -567,7 +567,6 @@ class PersistentControllerView(discord.ui.View):
 
             if player.queue.empty():
                 self.shuffle_button.disabled = True
-                self.queue_button.disabled = True
             if not player.current:
                 self.stop_button.disabled = True
 
