@@ -17,6 +17,11 @@ from pylav.type_hints.bot import DISCORD_INTERACTION_TYPE
 
 _ = Translator("PyLavController", Path(__file__))
 
+# Discord has no true "transparent" button; secondary/grey is the neutral style
+# that blends into the message background. Change this in one place to restyle
+# the whole controller.
+TRANSPARENT = discord.ButtonStyle.secondary
+
 
 if TYPE_CHECKING:
     from plcontroller.cog import PyLavController
@@ -189,6 +194,45 @@ class QueueHistoryButton(discord.ui.Button):
         ).start(ctx=context)
 
 
+class QueueButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.QUEUE,
+            row=row,
+            custom_id=custom_id,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        context = await self.cog.bot.get_context(interaction)
+        if not (player := context.player):
+            return await context.send(
+                embed=await self.cog.pylav.construct_embed(
+                    description=_("I am not connected to any voice channel at the moment."), messageable=interaction
+                ),
+                ephemeral=True,
+            )
+        if player.queue.empty():
+            return await context.send(
+                embed=await self.cog.pylav.construct_embed(
+                    description=_("There is nothing in the queue."), messageable=interaction
+                ),
+                ephemeral=True,
+            )
+        from pylav.extension.red.ui.menus.queue import QueueMenu
+        from pylav.extension.red.ui.sources.queue import QueueSource
+
+        await QueueMenu(
+            cog=self.cog,
+            bot=self.cog.bot,
+            source=QueueSource(guild_id=interaction.guild.id, cog=self.cog),
+            original_author=interaction.user,
+        ).start(ctx=context)
+
+
 class ToggleRepeatQueueButton(discord.ui.Button):
     def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
         super().__init__(
@@ -284,89 +328,94 @@ class PersistentControllerView(discord.ui.View):
         self.__prepare_lock = asyncio.Lock()
         self.__show_help = False
 
+        # Row 0 - playback controls
+        self.previous_track_button = PreviousTrackButton(
+            style=TRANSPARENT,
+            row=0,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:previous_track_button:9",
+        )
+        self.paused_button = PauseTrackButton(
+            style=TRANSPARENT,
+            row=0,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:paused_button:7",
+        )
+        self.resume_button = ResumeTrackButton(
+            style=TRANSPARENT,
+            row=0,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:resume_button:8",
+        )
+        self.skip_button = SkipTrackButton(
+            style=TRANSPARENT,
+            row=0,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:skip_button:10",
+        )
+        self.shuffle_button = ShuffleButton(
+            style=TRANSPARENT,
+            row=0,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:shuffle_button:11",
+        )
+        self.stop_button = StopTrackButton(
+            style=TRANSPARENT,
+            row=0,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:stop_button:12",
+        )
+
+        # Row 1 - volume, repeat and queue
+        self.decrease_volume_button = DecreaseVolumeButton(
+            style=TRANSPARENT,
+            row=1,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:decrease_volume_button:5",
+        )
+        self.increase_volume_button = IncreaseVolumeButton(
+            style=TRANSPARENT,
+            row=1,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:increase_volume_button:6",
+        )
         self.repeat_queue_button_on = ToggleRepeatQueueButton(
-            style=discord.ButtonStyle.blurple,
+            style=TRANSPARENT,
             row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:repeat_queue_button_on:1",
         )
         self.repeat_button_on = ToggleRepeatButton(
-            style=discord.ButtonStyle.blurple,
+            style=TRANSPARENT,
             row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:repeat_button_on:2",
         )
         self.repeat_button_off = ToggleRepeatButton(
-            style=discord.ButtonStyle.grey,
+            style=TRANSPARENT,
             row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:repeat_button_off:3",
         )
-
+        self.queue_button = QueueButton(
+            style=TRANSPARENT,
+            row=1,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:queue_button:14",
+        )
         self.show_history_button = QueueHistoryButton(
-            style=discord.ButtonStyle.grey,
+            style=TRANSPARENT,
             row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:show_history_button:4",
         )
 
-        self.decrease_volume_button = DecreaseVolumeButton(
-            style=discord.ButtonStyle.red,
-            row=3,
-            cog=cog,
-            custom_id="pylav__pylavcontroller_persistent_view:decrease_volume_button:5",
-        )
-        self.increase_volume_button = IncreaseVolumeButton(
-            style=discord.ButtonStyle.green,
-            row=3,
-            cog=cog,
-            custom_id="pylav__pylavcontroller_persistent_view:increase_volume_button:6",
-        )
-
+        # Row 2 - utility
         self.refresh_button = RefreshButton(
-            style=discord.ButtonStyle.green,
-            row=3,
+            style=TRANSPARENT,
+            row=2,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:refresh_button:13",
-        )
-
-        self.paused_button = PauseTrackButton(
-            style=discord.ButtonStyle.blurple,
-            row=2,
-            cog=cog,
-            custom_id="pylav__pylavcontroller_persistent_view:paused_button:7",
-        )
-        self.resume_button = ResumeTrackButton(
-            style=discord.ButtonStyle.blurple,
-            row=2,
-            cog=cog,
-            custom_id="pylav__pylavcontroller_persistent_view:resume_button:8",
-        )
-
-        self.previous_track_button = PreviousTrackButton(
-            style=discord.ButtonStyle.grey,
-            row=2,
-            cog=cog,
-            custom_id="pylav__pylavcontroller_persistent_view:previous_track_button:9",
-        )
-        self.skip_button = SkipTrackButton(
-            style=discord.ButtonStyle.grey,
-            row=2,
-            cog=cog,
-            custom_id="pylav__pylavcontroller_persistent_view:skip_button:10",
-        )
-        self.shuffle_button = ShuffleButton(
-            style=discord.ButtonStyle.grey,
-            row=2,
-            cog=cog,
-            custom_id="pylav__pylavcontroller_persistent_view:shuffle_button:11",
-        )
-
-        self.stop_button = StopTrackButton(
-            style=discord.ButtonStyle.red,
-            row=4,
-            cog=cog,
-            custom_id="pylav__pylavcontroller_persistent_view:stop_button:12",
         )
 
     def set_message(self, message: discord.Message):
@@ -462,6 +511,7 @@ class PersistentControllerView(discord.ui.View):
             player = self.cog.pylav.get_player(self.channel.guild.id)
             self.clear_items()
             self.show_history_button.disabled = False
+            self.queue_button.disabled = False
             self.repeat_button_on.disabled = False
             self.repeat_button_off.disabled = False
             self.repeat_queue_button_on.disabled = False
@@ -475,30 +525,34 @@ class PersistentControllerView(discord.ui.View):
             self.shuffle_button.disabled = False
             self.stop_button.disabled = False
 
+            # Row 0 - playback controls
+            self.add_item(self.previous_track_button)
+            if player is not None and player.paused or player is None:
+                self.add_item(self.resume_button)
+            else:
+                self.add_item(self.paused_button)
+            self.add_item(self.skip_button)
+            self.add_item(self.shuffle_button)
+            self.add_item(self.stop_button)
+
+            # Row 1 - volume, repeat and queue
+            self.add_item(self.decrease_volume_button)
+            self.add_item(self.increase_volume_button)
             if (player is not None) and (repeat_current := await player.config.fetch_repeat_current()):
                 self.add_item(self.repeat_button_on)
             elif (player is not None) and (not repeat_current) and (await player.config.fetch_repeat_queue()):
                 self.add_item(self.repeat_queue_button_on)
             else:
                 self.add_item(self.repeat_button_off)
+            self.add_item(self.queue_button)
             self.add_item(self.show_history_button)
-            self.add_item(self.decrease_volume_button)
-            self.add_item(self.increase_volume_button)
+
+            # Row 2 - utility
             self.add_item(self.refresh_button)
-
-            if player is not None and player.paused or player is None:
-                self.add_item(self.resume_button)
-            else:
-                self.add_item(self.paused_button)
-
-            self.add_item(self.previous_track_button)
-            self.add_item(self.skip_button)
-            self.add_item(self.shuffle_button)
-
-            self.add_item(self.stop_button)
 
             if player is None:
                 self.show_history_button.disabled = True
+                self.queue_button.disabled = True
                 self.repeat_button_off.disabled = True
                 self.decrease_volume_button.disabled = True
                 self.increase_volume_button.disabled = True
@@ -513,6 +567,7 @@ class PersistentControllerView(discord.ui.View):
 
             if player.queue.empty():
                 self.shuffle_button.disabled = True
+                self.queue_button.disabled = True
             if not player.current:
                 self.stop_button.disabled = True
 
