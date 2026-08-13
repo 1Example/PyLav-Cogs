@@ -19,9 +19,33 @@ About Cogs
 | [PyLavRadio](./plradio)             | 1.0.0     | plradio       | <details><summary>Load with `[p]load plradio`<br/><br/>Play radio stations.</summary>This cog allows you to interact with 30,000+ radio stations.</details>                                                                                                                                                                                                                                                                                                                                                                                  | Yes (1 root level slash command)                           | No                                     | [Draper](https://github.com/Drapersniper) |
 | [PyLavLyrics](./pllyrics)           | 1.0.0     | pllyrics      | <details><summary>Load with `[p]load pllyrics`<br/><br/>Add lyrics to PyLav tracks.</summary>This cog allows you to search for and display track lyrics.</details>                                                                                                                                                                                                                                                                                                                                                                           | No  (1 text-only command)                                  | No                                     | [Draper](https://github.com/Drapersniper) |
 | [PyLavController](./plcontroller)   | 1.0.0.rc1 | plcontroller  | <details><summary>Load with `[p]load plcontroller`<br/><br/>A Hydra like controller.</summary>This cog allows you to specify a channel where the bot will listen for messages to enqueue songs, and show a controller that can be interacted with.</details>                                                                                                                                                                                                                                                                                 | No  (1 text-only command)                                  | No                                     | [Draper](https://github.com/Drapersniper) |
+| [PyLavYouTubeRadio](./plytradio)    | 1.0.0     | plytradio     | <details><summary>Load with `[p]load plytradio`<br/><br/>YouTube recommendation based autoplay.</summary>When the queue runs dry this cog seeds a YouTube Mix from the track that just played and keeps queueing related songs, so playback continues indefinitely. Unlike PyLav's built-in autoplay, which picks at random from one fixed playlist, what plays next is related to what you were actually listening to. The queue is topped up before it empties so skip keeps working. Requires a Lavalink node with a working YouTube source.</details>| No  (4 text-only commands)                                 | No                                     | Local cog                                 |
 
 * Cogs with version 1.0.0rc0 are considered finished and stable bar feature requests.
 * Cogs under version 1.0.0 are considered under development and may change without notice.
+
+PyLavYouTubeRadio commands
+---------------------------
+
+| Command                        | Permission    | Description                                                                                      |
+|--------------------------------|---------------|--------------------------------------------------------------------------------------------------|
+| `[p]ytradio toggle <true/false>` | Manage Server | Turn YouTube radio on or off for this server.                                                    |
+| `[p]ytradio buffer <1-10>`       | Manage Server | How many recommended tracks to keep queued ahead. Default 3.                                     |
+| `[p]ytradio diagnose`            | Manage Server | Walk the whole pipeline against the current track and report which step fails. Alias: `test`.    |
+| `[p]ytradio reset`               | Manage Server | Forget which tracks the radio has already played in this server.                                 |
+
+> **Note**
+> Turn PyLav's built-in autoplay **off** before using this cog, otherwise it grabs a track from its
+> autoplay playlist first and the radio never gets a chance to run:
+> ```
+> [p]playerset server auto false
+> [p]ytradio toggle true
+> ```
+
+> **Warning**
+> This cog is not in the PyLav-Cogs repo, so `[p]cog install` will not find it.
+> Place the `plytradio` folder in a path registered with `[p]addpath`, then `[p]load plytradio`.
+
 
 Documentation
 ---------------------------
