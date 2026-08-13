@@ -2,560 +2,909 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import random
-from collections import defaultdict, deque
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING
 
 import discord
-from redbot.core import Config, commands
-from redbot.core.i18n import Translator, cog_i18n
+from redbot.core.i18n import Translator
 
-from pylav import logging
-from pylav.core.context import PyLavContext
-from pylav.events.track import TrackEndEvent, TrackSkippedEvent, TrackStartEvent
+from pylav.constants.config import DEFAULT_SEARCH_SOURCE
+from pylav.extension.red.utils import rgetattr
+from pylav.extension.red.utils.decorators import is_dj_logic
+from pylav.helpers import emojis
 from pylav.players.player import Player
-from pylav.players.query.obj import Query
-from pylav.players.tracks.obj import Track
-from pylav.type_hints.bot import DISCORD_BOT_TYPE, DISCORD_COG_TYPE_MIXIN
+from pylav.type_hints.bot import DISCORD_INTERACTION_TYPE
 
-_ = Translator("PyLavYouTubeRadio", Path(__file__))
+_ = Translator("PyLavController", Path(__file__))
 
-LOGGER = logging.getLogger("red.PyLav.cog.YouTubeRadio")
+# Discord has no true "transparent" button; secondary/grey is the neutral style
+# that blends into the message background. Change this in one place to restyle
+# the whole controller.
+TRANSPARENT = discord.ButtonStyle.secondary
 
-# Reasons that mean "the track played through to the end on its own".
-# Anything else (REPLACED, STOPPED, CLEANUP) means a human intervened,
-# and we must not hijack that.
-NATURAL_END_REASONS = {"finished", "FINISHED"}
+# How long the queue menu stays open with no interaction before it deletes
+# itself. PyLav's default is 600s, which leaves a large panel sitting above
+# the controller for ten minutes.
+QUEUE_MENU_TIMEOUT = 60
 
-# How many seed video IDs we remember per guild so the radio doesn't loop
-# back onto the same handful of tracks.
-SEED_MEMORY = 200
+# How long the ephemeral "I have skipped ..." style confirmations stay before
+# they are removed.
+EPHEMERAL_DELETE_AFTER = 5
 
-# How many alternate seeds to try when a mix runs out of unheard tracks.
-RESEED_ATTEMPTS = 4
+# Queue-menu buttons that reply with an ephemeral confirmation. These all
+# defer with thinking=True, so their response is safe to delete. Navigation
+# buttons are deliberately excluded -- they defer against the menu message
+# itself, and deleting their response would delete the menu.
+CONFIRMING_BUTTONS = frozenset(
+    {
+        "PreviousTrackButton",
+        "StopTrackButton",
+        "PauseTrackButton",
+        "ResumeTrackButton",
+        "SkipTrackButton",
+        "IncreaseVolumeButton",
+        "DecreaseVolumeButton",
+        "ToggleRepeatButton",
+        "ToggleRepeatQueueButton",
+        "ShuffleButton",
+        "DisconnectButton",
+        "EmptyQueueButton",
+        "RemoveFromQueueButton",
+        "PlayNowFromQueueButton",
+    }
+)
 
-# Top the queue up once it drops to this many tracks. Keeping it low means
-# tracks the user queued themselves are left alone until they're nearly done.
-LOW_WATER_MARK = 1
 
+class AutoDeletingFollowup:
+    """Wraps ``interaction.followup`` so ephemeral replies clean themselves up.
 
-@cog_i18n(_)
-class PyLavYouTubeRadio(DISCORD_COG_TYPE_MIXIN):
-    """Keeps playing YouTube's recommended tracks when the queue runs dry.
-
-    Unlike PyLav's built-in autoplay, this seeds a YouTube Mix from the
-    track that just finished, so what plays next is related to what you
-    were actually listening to.
+    Red sends command responses through ``interaction.followup.send``. We
+    cannot patch the Webhook itself (it uses ``__slots__``), but
+    ``Interaction.followup`` is a cached-slot property, so swapping the
+    cached value for this proxy lets us schedule a delete on anything sent
+    while a button callback is running.
     """
 
-    __version__ = "1.0.0"
+    __slots__ = ("_webhook", "_delay")
 
-    def __init__(self, bot: DISCORD_BOT_TYPE, *args: Any, **kwargs: Any):
-        super().__init__(*args, **kwargs)
-        self.bot = bot
-        self._config = Config.get_conf(self, identifier=208903205982044162)
-        self._config.register_guild(
-            enabled=False,
-            buffer=3,
+    def __init__(self, webhook, delay: float):
+        self._webhook = webhook
+        self._delay = delay
+
+    def __getattr__(self, item):
+        return getattr(self._webhook, item)
+
+    async def send(self, *args, **kwargs):
+        kwargs.setdefault("wait", True)
+        message = await self._webhook.send(*args, **kwargs)
+        if message is not None:
+            with contextlib.suppress(Exception):
+                # delay= schedules a background task and returns immediately.
+                await message.delete(delay=self._delay)
+        return message
+
+
+if TYPE_CHECKING:
+    from plcontroller.cog import PyLavController
+
+
+class IncreaseVolumeButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.VOLUME_UP,
+            row=row,
+            custom_id=custom_id,
         )
-        self._enabled_cache: dict[int, bool] = {}
-        self._buffer_cache: dict[int, int] = {}
-        # PyLav clears player.history when it stops on an empty queue, so we
-        # keep our own memory of what the radio has already served.
-        self._played: dict[int, deque[str]] = defaultdict(lambda: deque(maxlen=SEED_MEMORY))
-        # Video IDs we have already used as mix seeds, so reseeding keeps
-        # branching outward instead of circling back to the same mixes.
-        self._seeds: dict[int, deque[str]] = defaultdict(lambda: deque(maxlen=SEED_MEMORY))
-        self._lock: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self.cog = cog
 
-    async def cog_unload(self) -> None:
-        self._played.clear()
-        self._seeds.clear()
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        context = await self.cog.bot.get_context(interaction)
+        await self.cog.volume(context, change_by=5)
+        await self.view.update_view()
 
-    async def is_enabled(self, guild_id: int) -> bool:
-        if guild_id not in self._enabled_cache:
-            self._enabled_cache[guild_id] = await self._config.guild_from_id(guild_id).enabled()
-        return self._enabled_cache[guild_id]
 
-    async def get_buffer(self, guild_id: int) -> int:
-        if guild_id not in self._buffer_cache:
-            self._buffer_cache[guild_id] = await self._config.guild_from_id(guild_id).buffer()
-        return self._buffer_cache[guild_id]
-
-    # ------------------------------------------------------------------
-    # Seed resolution
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_tracks(response: Any) -> list[Any]:
-        """Pull the track list out of a loadtracks response.
-
-        PyLav's response objects changed shape between Lavalink v3 and v4:
-
-          v3: TrackLoaded / PlaylistLoaded / SearchResult, all with .tracks
-          v4: TrackResponse / PlaylistResponse / SearchResponse, where the
-              payload lives under .data -- a list for searches, an object
-              with .tracks for playlists, a bare track for single loads.
-
-        This handles both so the cog doesn't break on a PyLav update.
-        """
-        if not response:
-            return []
-
-        # v3 shape, and v4 responses that still expose a flat list.
-        tracks = getattr(response, "tracks", None)
-        if tracks:
-            return list(tracks)
-
-        data = getattr(response, "data", None)
-        if data is None:
-            return []
-        if isinstance(data, list):
-            return list(data)
-
-        nested = getattr(data, "tracks", None)
-        if nested:
-            return list(nested)
-
-        # Single track load: data is the track itself.
-        if getattr(data, "encoded", None) or getattr(data, "info", None):
-            return [data]
-        return []
-
-    @classmethod
-    def _unique(cls, tracks: list[Any]) -> list[Any]:
-        """Drop duplicates while preserving order -- mixes can list a song twice."""
-        seen: set[str] = set()
-        out = []
-        for track in tracks:
-            key = cls._track_key(track)
-            if key is None or key in seen:
-                continue
-            seen.add(key)
-            out.append(track)
-        return out
-
-    @staticmethod
-    def _track_key(track: Any) -> str | None:
-        """Stable identity for a track, used for de-duplication.
-
-        The video identifier is far more reliable than the encoded blob:
-        encoded strings carry position and version data, so the same song
-        fetched twice can produce two different strings and slip past a
-        de-dupe keyed on them.
-        """
-        info = getattr(track, "info", None)
-        identifier = getattr(info, "identifier", None)
-        if identifier:
-            return identifier
-        with contextlib.suppress(Exception):
-            if encoded := getattr(track, "encoded", None):
-                return encoded
-        return None
-
-    async def _seed_key(self, track: Track) -> str | None:
-        """Same as _track_key but for a live player track (async accessors)."""
-        with contextlib.suppress(Exception):
-            if identifier := await track.identifier():
-                return identifier
-        with contextlib.suppress(Exception):
-            if encoded := track.encoded:
-                return encoded
-        return None
-
-    async def _youtube_id_for(self, track: Track) -> str | None:
-        """Return a YouTube video ID to seed the mix from.
-
-        YouTube tracks hand us their identifier directly. Anything else
-        (Spotify, Deezer, Apple Music) has no video ID, so we resolve it by
-        searching YouTube for the title and artist and taking the top hit.
-        """
-        with contextlib.suppress(Exception):
-            source = await track.source()
-            identifier = await track.identifier()
-            if source and "youtube" in source.lower() and identifier:
-                return identifier
-
-        try:
-            title = await track.title()
-            author = await track.author()
-        except Exception:
-            LOGGER.debug("Could not read metadata off the finished track")
-            return None
-
-        terms = " ".join(part for part in (title, author) if part).strip()
-        if not terms:
-            return None
-
-        query = await Query.from_string(f"ytsearch:{terms}")
-        # get_tracks drops search results unless fullsearch is True --
-        # the branch is `fullsearch and is_search or is_single`, and a
-        # search query is not is_single, so False here returns nothing.
-        response = await self.pylav.get_tracks(query, fullsearch=True)
-        results = self._extract_tracks(response)
-        if not results:
-            LOGGER.debug("No YouTube match found for %s", terms)
-            return None
-
-        candidate = await Track.build_track(
-            node=await self.pylav.node_manager.find_best_node(),
-            data=results[0],
-            query=None,
-            requester=self.bot.user.id,
+class DecreaseVolumeButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.VOLUME_DOWN,
+            row=row,
+            custom_id=custom_id,
         )
-        with contextlib.suppress(Exception):
-            return await candidate.identifier()
-        return None
+        self.cog = cog
 
-    async def _fetch_mix(self, video_id: str, player: Player) -> list[Any]:
-        """Load a YouTube Mix (radio) playlist seeded from a video ID."""
-        url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
-        query = await Query.from_string(url)
-        response = await self.pylav.get_tracks(query, player=player)
-        tracks = self._extract_tracks(response)
-        if not tracks:
-            LOGGER.debug(
-                "Mix RD%s returned no usable tracks (response type: %s)",
-                video_id,
-                type(response).__name__,
-            )
-        return tracks
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        context = await self.cog.bot.get_context(interaction)
+        await self.cog.volume(context, change_by=-5)
+        await self.view.update_view()
 
-    # ------------------------------------------------------------------
-    # Shared top-up logic
-    # ------------------------------------------------------------------
 
-    async def _top_up(self, player: Player, seed_track: Track | None, start_playback: bool) -> int:
-        """Fetch radio tracks seeded from ``seed_track`` and queue them.
-
-        Returns the number of tracks added.
-        """
-        guild_id = player.guild.id
-        if seed_track is None:
-            LOGGER.debug("Guild %s: no seed track available", guild_id)
-            return 0
-        if not player.is_connected:
-            LOGGER.debug("Guild %s: player disconnected", guild_id)
-            return 0
-
-        with contextlib.suppress(Exception):
-            if key := await self._seed_key(seed_track):
-                self._played[guild_id].append(key)
-
-        video_id = await self._youtube_id_for(seed_track)
-        if not video_id:
-            LOGGER.debug("Guild %s: could not resolve a YouTube seed", guild_id)
-            return 0
-
-        candidates = await self._fetch_mix(video_id, player)
-        if not candidates:
-            return 0
-
-        played = set(self._played[guild_id])
-        # Also exclude anything sitting in the queue right now, otherwise a
-        # mix that lists the same song twice can queue it twice.
-        queued: set[str] = set()
-        with contextlib.suppress(Exception):
-            queued = {b64 for b64 in player.queue.raw_b64s if b64}
-        with contextlib.suppress(Exception):
-            for entry in player.queue.raw_queue:
-                if key := self._track_key(entry):
-                    queued.add(key)
-
-        excluded = played | queued
-        fresh = self._unique([t for t in candidates if self._track_key(t) not in excluded])
-
-        # A YouTube mix is a fixed pool of roughly 25 tracks, and seeding it
-        # from a song that is itself in that mix returns much the same list.
-        # Once we have heard all of them, branch onto a different mix rather
-        # than replaying what just went by.
-        if not fresh:
-            LOGGER.debug("Guild %s: mix RD%s exhausted, reseeding", guild_id, video_id)
-            fresh, candidates = await self._reseed(player, candidates, excluded)
-
-        pool = fresh or self._unique(candidates)
-        if not fresh:
-            LOGGER.debug("Guild %s: no fresh tracks anywhere, allowing repeats", guild_id)
-
-        target = max(1, await self.get_buffer(guild_id))
-        shortfall = max(1, target - player.queue.qsize())
-        # Random rather than the first N: taking the head of the list every
-        # time makes the radio walk the same few tracks in the same order.
-        chosen = random.sample(pool, min(shortfall, len(pool)))
-        if not chosen:
-            return 0
-
-        for track in chosen:
-            if key := self._track_key(track):
-                self._played[guild_id].append(key)
-
-        requester = player.guild.me
-        await player.bulk_add(tracks_and_queries=chosen, requester=requester.id)
-
-        if start_playback and player.current is None:
-            await player.play(None, None, requester=requester)
-
-        LOGGER.debug("Guild %s: queued %s radio tracks", guild_id, len(chosen))
-        return len(chosen)
-
-    async def _reseed(self, player: Player, candidates: list[Any], played: set[str]) -> tuple[list[Any], list[Any]]:
-        """Branch onto a different YouTube mix when the current one is used up.
-
-        Picks a track from the exhausted mix that we have not already seeded
-        from and fetches its mix instead. Returns (fresh, candidates).
-        """
-        guild_id = player.guild.id
-        seeds_tried = self._seeds[guild_id]
-
-        options = [t for t in candidates if (k := self._track_key(t)) and k not in seeds_tried]
-        random.shuffle(options)
-
-        for alternate in options[:RESEED_ATTEMPTS]:
-            key = self._track_key(alternate)
-            seeds_tried.append(key)
-            more = await self._fetch_mix(key, player)
-            if not more:
-                continue
-            fresh = [t for t in more if self._track_key(t) not in played]
-            if fresh:
-                LOGGER.debug("Guild %s: reseeded onto mix RD%s (%s fresh)", guild_id, key, len(fresh))
-                return fresh, more
-
-        return [], candidates
-
-    # ------------------------------------------------------------------
-    # Hooks
-    # ------------------------------------------------------------------
-
-    @commands.Cog.listener()
-    async def on_pylav_track_start_event(self, event: TrackStartEvent) -> None:
-        """Keep the queue topped up so it never actually runs dry.
-
-        This is what makes skip work. If we only reacted to the queue
-        emptying, skipping the last track would call next() on an empty
-        queue, which stops the player and reports the end reason as
-        STOPPED -- indistinguishable from the user pressing stop.
-        """
-        player: Player = event.player
-        if player is None or player.guild is None:
-            return
-        guild_id = player.guild.id
-
-        if not await self.is_enabled(guild_id):
-            return
-        # Only step in when the queue is nearly exhausted, so tracks the
-        # user queued themselves play through untouched.
-        if player.queue.qsize() > LOW_WATER_MARK:
-            return
-        if self._lock[guild_id].locked():
-            return
-
-        async with self._lock[guild_id]:
-            if player.queue.qsize() > LOW_WATER_MARK:
-                return
-            await self._top_up(player, player.current or event.track, start_playback=False)
-
-    @commands.Cog.listener()
-    async def on_pylav_track_skipped_event(self, event: TrackSkippedEvent) -> None:
-        """Safety net: a skip that emptied the player should not end the session."""
-        player: Player = event.player
-        if player is None or player.guild is None:
-            return
-        guild_id = player.guild.id
-
-        if not await self.is_enabled(guild_id):
-            return
-
-        async with self._lock[guild_id]:
-            if player.current is not None or not player.queue.empty():
-                return
-            LOGGER.debug("Guild %s: skip emptied the player, reloading radio", guild_id)
-            await self._top_up(player, event.track, start_playback=True)
-
-    @commands.Cog.listener()
-    async def on_pylav_track_end_event(self, event: TrackEndEvent) -> None:
-        """Fallback for when a track finishes and nothing is left to play."""
-        player: Player = event.player
-        if player is None or player.guild is None:
-            return
-        guild_id = player.guild.id
-
-        if event.reason not in NATURAL_END_REASONS:
-            LOGGER.debug("Track ended in guild %s with reason %s - ignoring", guild_id, event.reason)
-            return
-        if not await self.is_enabled(guild_id):
-            return
-
-        async with self._lock[guild_id]:
-            # PyLav has already run next() by the time this fires. If
-            # something is playing or queued, we should stay out of the way.
-            if player.current is not None or not player.queue.empty():
-                return
-            LOGGER.debug("Guild %s: queue ran dry, reloading radio", guild_id)
-            await self._top_up(player, event.track, start_playback=True)
-
-    # ------------------------------------------------------------------
-    # Commands
-    # ------------------------------------------------------------------
-
-    @commands.group(name="ytradio")
-    @commands.guild_only()
-    async def command_ytradio(self, context: PyLavContext) -> None:
-        """Control YouTube radio autoplay."""
-
-    @command_ytradio.command(name="toggle")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def command_ytradio_toggle(self, context: PyLavContext, toggle: bool) -> None:
-        """Turn YouTube radio on or off for this server."""
-        if isinstance(context, discord.Interaction):
-            context = await self.bot.get_context(context)
-        if context.interaction and not context.interaction.response.is_done():
-            await context.defer(ephemeral=True)
-
-        await self._config.guild(context.guild).enabled.set(toggle)
-        self._enabled_cache[context.guild.id] = toggle
-
-        if toggle:
-            message = _(
-                "When the queue runs out I will keep playing tracks recommended by YouTube "
-                "based on whatever played last."
-            )
-        else:
-            message = _("I will stop playing recommended tracks when the queue runs out.")
-
-        await context.send(
-            embed=await self.pylav.construct_embed(description=message, messageable=context),
-            ephemeral=True,
+class StopTrackButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.STOP,
+            row=row,
+            custom_id=custom_id,
         )
+        self.cog = cog
 
-    @command_ytradio.command(name="buffer")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def command_ytradio_buffer(self, context: PyLavContext, size: int) -> None:
-        """Set how many recommended tracks to queue at a time (1-10)."""
-        if isinstance(context, discord.Interaction):
-            context = await self.bot.get_context(context)
-        if context.interaction and not context.interaction.response.is_done():
-            await context.defer(ephemeral=True)
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        context = await self.cog.bot.get_context(interaction)
+        await self.cog.stop(context)
+        await self.view.update_view(forced=True)
 
-        if not 1 <= size <= 10:
-            await context.send(
-                embed=await self.pylav.construct_embed(
-                    description=_("Pick a number between 1 and 10."), messageable=context
+
+class PauseTrackButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.PAUSE,
+            row=row,
+            custom_id=custom_id,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        context = await self.cog.bot.get_context(interaction)
+        await self.cog.pause(context)
+        await self.view.update_view()
+
+
+class ResumeTrackButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.PLAY,
+            row=row,
+            custom_id=custom_id,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        context = await self.cog.bot.get_context(interaction)
+        await self.cog.resume(context)
+        await self.view.update_view()
+
+
+class SkipTrackButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.NEXT,
+            row=row,
+            custom_id=custom_id,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        context = await self.cog.bot.get_context(interaction)
+        await self.cog.skip(context)
+        await self.view.update_view()
+
+
+class ToggleRepeatButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.LOOP,
+            row=row,
+            custom_id=custom_id,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        context = await self.cog.bot.get_context(interaction)
+        player = context.player
+        if not player:
+            return await context.send(
+                embed=await self.cog.pylav.construct_embed(
+                    description=_("I am not connected to any voice channel at the moment."), messageable=interaction
                 ),
                 ephemeral=True,
             )
-            return
+        await self.cog.repeat(context, queue=await player.config.fetch_repeat_current())
+        await self.view.update_view()
 
-        await self._config.guild(context.guild).buffer.set(size)
-        self._buffer_cache[context.guild.id] = size
-        await context.send(
-            embed=await self.pylav.construct_embed(
-                description=_("I will queue {number} recommended tracks at a time.").format(number=size),
-                messageable=context,
-            ),
-            ephemeral=True,
+
+class QueueHistoryButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.PLAYLIST,
+            row=row,
+            custom_id=custom_id,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        context = await self.cog.bot.get_context(interaction)
+        if not (__ := context.player):
+            return await context.send(
+                embed=await self.cog.pylav.construct_embed(
+                    description=_("I am not connected to any voice channel at the moment."), messageable=interaction
+                ),
+                ephemeral=True,
+            )
+        from pylav.extension.red.ui.sources.queue import QueueSource
+
+        command_cog = resolve_command_cog(self.cog)
+        menu_cls = get_controller_queue_menu()
+
+        await menu_cls(
+            cog=command_cog,
+            bot=self.cog.bot,
+            source=QueueSource(guild_id=interaction.guild.id, cog=command_cog, history=True),
+            original_author=interaction.user,
+            history=True,
+        ).start(ctx=context)
+
+
+async def delete_response_later(interaction, delay: float) -> None:
+    """Delete an interaction's original response after ``delay`` seconds."""
+    await asyncio.sleep(delay)
+    with contextlib.suppress(Exception):
+        await interaction.delete_original_response()
+
+
+_CONTROLLER_QUEUE_MENU = None
+
+
+def resolve_command_cog(cog):
+    """Return the cog that actually owns the player commands.
+
+    PyLav's queue menu buttons call things like ``cog.command_skip`` and
+    ``cog.command_volume_change_by``. Those live on the PyLavPlayer (audio)
+    cog, not on PyLavController, so handing the menu ``self`` makes every
+    one of those buttons raise AttributeError. Hand it the audio cog
+    instead, falling back to the controller if audio isn't loaded.
+    """
+    return cog.bot.get_cog("PyLavPlayer") or cog
+
+
+def get_controller_queue_menu():
+    """Build (once) a QueueMenu restyled to match the controller panel.
+
+    Imported lazily because pylav's menu module pulls in the sources and
+    buttons packages, and importing those at module scope risks a circular
+    import during cog load.
+    """
+    global _CONTROLLER_QUEUE_MENU
+    if _CONTROLLER_QUEUE_MENU is not None:
+        return _CONTROLLER_QUEUE_MENU
+
+    from pylav.extension.red.ui.menus.queue import QueueMenu
+
+    class ControllerQueueMenu(QueueMenu):
+        """QueueMenu with the controller's transparent styling and grouping."""
+
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("timeout", QUEUE_MENU_TIMEOUT)
+            kwargs.setdefault("delete_after_timeout", True)
+            super().__init__(*args, **kwargs)
+
+            # Every button transparent, same as the controller panel.
+            for attribute in vars(self).values():
+                if isinstance(attribute, discord.ui.Button):
+                    attribute.style = TRANSPARENT
+
+            # Regroup to mirror the controller: playback first, then
+            # volume/repeat, then navigation, then queue management.
+            # prepare() places items by each button's row attribute, so
+            # reordering here needs no changes to prepare() itself.
+            for button, row in (
+                (self.previous_track_button, 0),
+                (self.paused_button, 0),
+                (self.resume_button, 0),
+                (self.skip_button, 0),
+                (self.shuffle_button, 0),
+                (self.stop_button, 0),
+                (self.decrease_volume_button, 1),
+                (self.increase_volume_button, 1),
+                (self.repeat_button_on, 1),
+                (self.repeat_button_off, 1),
+                (self.repeat_queue_button_on, 1),
+                (self.show_history_button, 1),
+                (self.refresh_button, 1),
+                (self.first_button, 2),
+                (self.backward_button, 2),
+                (self.forward_button, 2),
+                (self.last_button, 2),
+                (self.close_button, 2),
+                (self.enqueue_button, 3),
+                (self.remove_from_queue_button, 3),
+                (self.play_now_button, 3),
+                (self.clear_queue_button, 3),
+                (self.queue_disconnect, 3),
+            ):
+                button.row = row
+
+            for attribute in vars(self).values():
+                if isinstance(attribute, discord.ui.Button):
+                    self._wrap_for_auto_delete(attribute)
+
+        @staticmethod
+        def _wrap_for_auto_delete(button: discord.ui.Button) -> None:
+            """Make a button's ephemeral confirmation delete itself shortly after."""
+            if type(button).__name__ not in CONFIRMING_BUTTONS:
+                return
+            original = button.callback
+            if getattr(original, "__plc_wrapped__", False):
+                return
+
+            async def wrapped(interaction, *, _original=original):
+                real_followup = interaction.followup
+                with contextlib.suppress(Exception):
+                    interaction._cs_followup = AutoDeletingFollowup(real_followup, EPHEMERAL_DELETE_AFTER)
+                try:
+                    await _original(interaction)
+                finally:
+                    with contextlib.suppress(Exception):
+                        interaction._cs_followup = real_followup
+                    # If the reply landed on the original deferred response
+                    # rather than a followup, clear that too.
+                    asyncio.create_task(delete_response_later(interaction, EPHEMERAL_DELETE_AFTER))
+
+            wrapped.__plc_wrapped__ = True
+            button.callback = wrapped
+
+        def _display_order(self) -> list:
+            """Left-to-right order within each row, mirroring the panel."""
+            return [
+                self.previous_track_button,
+                self.paused_button,
+                self.resume_button,
+                self.skip_button,
+                self.shuffle_button,
+                self.stop_button,
+                self.decrease_volume_button,
+                self.increase_volume_button,
+                self.repeat_button_on,
+                self.repeat_button_off,
+                self.repeat_queue_button_on,
+                self.show_history_button,
+                self.refresh_button,
+                self.first_button,
+                self.backward_button,
+                self.forward_button,
+                self.last_button,
+                self.close_button,
+                self.enqueue_button,
+                self.remove_from_queue_button,
+                self.play_now_button,
+                self.clear_queue_button,
+                self.queue_disconnect,
+            ]
+
+        async def prepare(self):
+            await super().prepare()
+            # prepare() adds buttons in its own order, and discord.py keeps
+            # insertion order within a row. Re-sort so the row contents read
+            # the same way round as the controller panel. The sort is stable
+            # and keyed on the same attribute discord.py renders by, so
+            # anything unrecognised keeps its relative position at the end.
+            priority = {id(button): index for index, button in enumerate(self._display_order())}
+            self._children.sort(
+                key=lambda child: (
+                    getattr(child, "_rendered_row", None) or 0,
+                    priority.get(id(child), len(priority)),
+                )
+            )
+
+    _CONTROLLER_QUEUE_MENU = ControllerQueueMenu
+    return _CONTROLLER_QUEUE_MENU
+
+
+class QueueButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.QUEUE,
+            row=row,
+            custom_id=custom_id,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        context = await self.cog.bot.get_context(interaction)
+        if not (player := context.player):
+            return await context.send(
+                embed=await self.cog.pylav.construct_embed(
+                    description=_("I am not connected to any voice channel at the moment."), messageable=interaction
+                ),
+                ephemeral=True,
+            )
+        if player.queue.empty():
+            return await context.send(
+                embed=await self.cog.pylav.construct_embed(
+                    description=_("There is nothing in the queue."), messageable=interaction
+                ),
+                ephemeral=True,
+            )
+        from pylav.extension.red.ui.sources.queue import QueueSource
+
+        command_cog = resolve_command_cog(self.cog)
+        menu_cls = get_controller_queue_menu()
+
+        await menu_cls(
+            cog=command_cog,
+            bot=self.cog.bot,
+            source=QueueSource(guild_id=interaction.guild.id, cog=command_cog),
+            original_author=interaction.user,
+        ).start(ctx=context)
+
+
+class ToggleRepeatQueueButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.REPEAT,
+            row=row,
+            custom_id=custom_id,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        context = await self.cog.bot.get_context(interaction)
+        player = context.player
+        if not player:
+            return await context.send(
+                embed=await self.cog.pylav.construct_embed(
+                    description=_("I am not connected to any voice channel at the moment."), messageable=interaction
+                ),
+                ephemeral=True,
+            )
+        repeat_queue = bool(await player.config.fetch_repeat_current())
+        await self.cog.repeat(context, queue=repeat_queue)
+        await self.view.update_view()
+
+
+class ShuffleButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.RANDOM,
+            row=row,
+            custom_id=custom_id,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        context = await self.cog.bot.get_context(interaction)
+        await self.cog.shuffle(context)
+        await self.view.update_view()
+
+
+class PreviousTrackButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.PREVIOUS,
+            row=row,
+            custom_id=custom_id,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        context = await self.cog.bot.get_context(interaction)
+        await self.cog.previous(context)
+        await self.view.update_view()
+
+
+class RefreshButton(discord.ui.Button):
+    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+        super().__init__(
+            style=style,
+            emoji=emojis.UPDATE,
+            row=row,
+            custom_id=custom_id,
+        )
+        self.cog = cog
+
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        await self.view.update_view()
+
+
+class PersistentControllerView(discord.ui.View):
+    def __init__(
+        self,
+        cog: PyLavController,
+        channel: discord.TextChannel | discord.Thread | discord.VoiceChannel,
+        message: discord.Message = None,
+    ):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.message: discord.Message | None = message
+        self.channel = channel
+        self.guild = channel.guild
+        self.__update_view_lock = asyncio.Lock()
+        self.__prepare_lock = asyncio.Lock()
+        self.__show_help = False
+
+        # Row 0 - playback controls
+        self.previous_track_button = PreviousTrackButton(
+            style=TRANSPARENT,
+            row=0,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:previous_track_button:9",
+        )
+        self.paused_button = PauseTrackButton(
+            style=TRANSPARENT,
+            row=0,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:paused_button:7",
+        )
+        self.resume_button = ResumeTrackButton(
+            style=TRANSPARENT,
+            row=0,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:resume_button:8",
+        )
+        self.skip_button = SkipTrackButton(
+            style=TRANSPARENT,
+            row=0,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:skip_button:10",
+        )
+        self.shuffle_button = ShuffleButton(
+            style=TRANSPARENT,
+            row=0,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:shuffle_button:11",
+        )
+        self.stop_button = StopTrackButton(
+            style=TRANSPARENT,
+            row=0,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:stop_button:12",
         )
 
-    @command_ytradio.command(name="diagnose", aliases=["test"])
-    @commands.admin_or_permissions(manage_guild=True)
-    async def command_ytradio_diagnose(self, context: PyLavContext) -> None:
-        """Walk the radio pipeline against the current track and report each step."""
-        if isinstance(context, discord.Interaction):
-            context = await self.bot.get_context(context)
-        if context.interaction and not context.interaction.response.is_done():
-            await context.defer(ephemeral=True)
-
-        lines: list[str] = []
-        guild_id = context.guild.id
-
-        enabled = await self.is_enabled(guild_id)
-        lines.append(f"{'PASS' if enabled else 'FAIL'} - radio enabled: {enabled}")
-
-        player: Player | None = self.pylav.get_player(guild_id)
-        if player is None:
-            lines.append("FAIL - no player. Play something first, then run this.")
-            await self._send_diagnosis(context, lines)
-            return
-        lines.append("PASS - player exists")
-
-        builtin = False
-        with contextlib.suppress(Exception):
-            builtin = await player.autoplay_enabled()
-        if builtin:
-            lines.append("FAIL - PyLav autoplay is ON and will pre-empt the radio.")
-            lines.append("       Run: [p]playerset server auto false")
-        else:
-            lines.append("PASS - PyLav built-in autoplay is off")
-
-        with contextlib.suppress(Exception):
-            dc = await player.config.fetch_empty_queue_dc()
-            if getattr(dc, "enabled", False):
-                lines.append("WARN - empty-queue disconnect is on; bot may leave before the radio loads.")
-
-        seed = player.current or player.last_track
-        if seed is None:
-            lines.append("FAIL - nothing playing and no last track to seed from.")
-            await self._send_diagnosis(context, lines)
-            return
-
-        with contextlib.suppress(Exception):
-            lines.append(f"PASS - seed track: {await seed.title()}")
-
-        with contextlib.suppress(Exception):
-            if await seed.stream():
-                lines.append("WARN - seed is a livestream. Streams never end, so the")
-                lines.append("       radio hook will never fire while one is playing.")
-
-        video_id = await self._youtube_id_for(seed)
-        if not video_id:
-            lines.append("FAIL - could not resolve a YouTube video ID for the seed.")
-            await self._send_diagnosis(context, lines)
-            return
-        lines.append(f"PASS - resolved video ID: {video_id}")
-
-        tracks = await self._fetch_mix(video_id, player)
-        if not tracks:
-            lines.append(f"FAIL - mix RD{video_id} returned no tracks.")
-            lines.append("       Your Lavalink node's YouTube source may be broken,")
-            lines.append("       or this video has no mix available.")
-            await self._send_diagnosis(context, lines)
-            return
-        lines.append(f"PASS - mix returned {len(tracks)} tracks")
-
-        already = len(self._played[guild_id])
-        lines.append(f"INFO - {already} tracks in this guild's radio memory")
-        lines.append("")
-        lines.append("Pipeline works. If playback still stops, the listener isn't")
-        lines.append("firing - check that track end reason is FINISHED, not STOPPED.")
-
-        await self._send_diagnosis(context, lines)
-
-    async def _send_diagnosis(self, context: PyLavContext, lines: list[str]) -> None:
-        body = "\n".join(lines)
-        await context.send(
-            embed=await self.pylav.construct_embed(
-                title=_("YouTube radio diagnostics"),
-                description=f"```\n{body}\n```",
-                messageable=context,
-            ),
-            ephemeral=True,
+        # Row 1 - volume, repeat and queue
+        self.decrease_volume_button = DecreaseVolumeButton(
+            style=TRANSPARENT,
+            row=1,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:decrease_volume_button:5",
+        )
+        self.increase_volume_button = IncreaseVolumeButton(
+            style=TRANSPARENT,
+            row=1,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:increase_volume_button:6",
+        )
+        self.repeat_queue_button_on = ToggleRepeatQueueButton(
+            style=TRANSPARENT,
+            row=1,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:repeat_queue_button_on:1",
+        )
+        self.repeat_button_on = ToggleRepeatButton(
+            style=TRANSPARENT,
+            row=1,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:repeat_button_on:2",
+        )
+        self.repeat_button_off = ToggleRepeatButton(
+            style=TRANSPARENT,
+            row=1,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:repeat_button_off:3",
+        )
+        self.queue_button = QueueButton(
+            style=TRANSPARENT,
+            row=1,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:queue_button:14",
+        )
+        self.show_history_button = QueueHistoryButton(
+            style=TRANSPARENT,
+            row=1,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:show_history_button:4",
         )
 
-    @command_ytradio.command(name="reset")
-    @commands.admin_or_permissions(manage_guild=True)
-    async def command_ytradio_reset(self, context: PyLavContext) -> None:
-        """Forget which tracks the radio has already played here."""
-        if isinstance(context, discord.Interaction):
-            context = await self.bot.get_context(context)
-        if context.interaction and not context.interaction.response.is_done():
-            await context.defer(ephemeral=True)
-
-        self._played.pop(context.guild.id, None)
-        self._seeds.pop(context.guild.id, None)
-        await context.send(
-            embed=await self.pylav.construct_embed(
-                description=_("Radio history cleared."), messageable=context
-            ),
-            ephemeral=True,
+        # Row 2 - utility
+        self.refresh_button = RefreshButton(
+            style=TRANSPARENT,
+            row=2,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:refresh_button:13",
         )
+
+    def set_message(self, message: discord.Message):
+        self.message = message
+
+    def enable_show_help(self) -> None:
+        self.__show_help = True
+
+    def disable_show_help(self) -> None:
+        self.__show_help = False
+
+    async def enable_slow_mode(self) -> None:
+        if self.channel.slowmode_delay != 0:
+            return
+        await self.channel.edit(slowmode_delay=5)
+
+    async def disable_slow_mode(self) -> None:
+        if self.channel.slowmode_delay == 0:
+            return
+        await self.channel.edit(slowmode_delay=0)
+
+    async def set_permissions(self):
+        if isinstance(self.channel, discord.Thread):
+            # Threads don't have permissions, so we can't set them
+            #    We don't want to edit the permissions of the parent channel
+            #    as that would affect the entire channel and all its threads.
+            return
+        permissions = self.channel.permissions_for(self.channel.guild.me)
+        if permissions.manage_roles or self.guild.me.guild_permissions.manage_roles:
+            default_role_permissions = self.channel.permissions_for(self.channel.guild.default_role)
+            if not all(
+                [
+                    default_role_permissions.view_channel,
+                    default_role_permissions.read_messages,
+                    default_role_permissions.send_messages,
+                    default_role_permissions.read_message_history,
+                ]
+            ) or any(
+                [
+                    default_role_permissions.create_instant_invite,
+                    default_role_permissions.manage_channels,
+                    default_role_permissions.add_reactions,
+                    default_role_permissions.send_tts_messages,
+                    default_role_permissions.manage_messages,
+                    default_role_permissions.embed_links,
+                    default_role_permissions.attach_files,
+                    default_role_permissions.mention_everyone,
+                    default_role_permissions.external_emojis,
+                    default_role_permissions.manage_roles,
+                    default_role_permissions.manage_webhooks,
+                    default_role_permissions.use_application_commands,
+                    default_role_permissions.create_public_threads,
+                    default_role_permissions.create_private_threads,
+                    default_role_permissions.external_stickers,
+                    default_role_permissions.send_messages_in_threads,
+                    default_role_permissions.manage_events,
+                    default_role_permissions.manage_threads,
+                    default_role_permissions.use_embedded_activities,
+                ]
+            ):
+                with contextlib.suppress(discord.Forbidden):
+                    # No explicitly needed; However, just here to allow for a cleaner channel.
+                    await self.channel.set_permissions(
+                        self.channel.guild.default_role,
+                        view_channel=True,
+                        read_messages=True,
+                        send_messages=True,
+                        read_message_history=True,
+                        create_instant_invite=False,
+                        manage_channels=False,
+                        add_reactions=False,
+                        send_tts_messages=False,
+                        manage_messages=False,
+                        embed_links=False,
+                        attach_files=False,
+                        mention_everyone=False,
+                        external_emojis=False,
+                        manage_roles=False,
+                        manage_webhooks=False,
+                        use_application_commands=False,
+                        create_public_threads=False,
+                        create_private_threads=False,
+                        external_stickers=False,
+                        send_messages_in_threads=False,
+                        manage_events=False,
+                        manage_threads=False,
+                        use_embedded_activities=False,
+                        reason=_("PyLav Controller"),
+                    )
+
+    async def prepare(self):
+        async with self.__prepare_lock:
+            player = self.cog.pylav.get_player(self.channel.guild.id)
+            self.clear_items()
+            self.show_history_button.disabled = False
+            self.queue_button.disabled = False
+            self.repeat_button_on.disabled = False
+            self.repeat_button_off.disabled = False
+            self.repeat_queue_button_on.disabled = False
+            self.decrease_volume_button.disabled = False
+            self.increase_volume_button.disabled = False
+            self.refresh_button.disabled = False
+            self.paused_button.disabled = False
+            self.resume_button.disabled = False
+            self.previous_track_button.disabled = False
+            self.skip_button.disabled = False
+            self.shuffle_button.disabled = False
+            self.stop_button.disabled = False
+
+            # Row 0 - playback controls
+            self.add_item(self.previous_track_button)
+            if player is not None and player.paused or player is None:
+                self.add_item(self.resume_button)
+            else:
+                self.add_item(self.paused_button)
+            self.add_item(self.skip_button)
+            self.add_item(self.shuffle_button)
+            self.add_item(self.stop_button)
+
+            # Row 1 - volume, repeat and queue
+            self.add_item(self.decrease_volume_button)
+            self.add_item(self.increase_volume_button)
+            if (player is not None) and (repeat_current := await player.config.fetch_repeat_current()):
+                self.add_item(self.repeat_button_on)
+            elif (player is not None) and (not repeat_current) and (await player.config.fetch_repeat_queue()):
+                self.add_item(self.repeat_queue_button_on)
+            else:
+                self.add_item(self.repeat_button_off)
+            self.add_item(self.queue_button)
+            self.add_item(self.show_history_button)
+
+            # Row 2 - utility
+            self.add_item(self.refresh_button)
+
+            if player is None:
+                self.show_history_button.disabled = True
+                self.queue_button.disabled = True
+                self.repeat_button_off.disabled = True
+                self.decrease_volume_button.disabled = True
+                self.increase_volume_button.disabled = True
+
+                self.resume_button.disabled = True
+                self.previous_track_button.disabled = True
+                self.skip_button.disabled = True
+                self.shuffle_button.disabled = True
+
+                self.stop_button.disabled = True
+                return
+
+            if player.queue.empty():
+                self.shuffle_button.disabled = True
+            if not player.current:
+                self.stop_button.disabled = True
+
+            if player.history.empty():
+                self.previous_track_button.disabled = True
+                self.show_history_button.disabled = True
+
+    async def get_player(self, message: discord.Message) -> Player | None:
+        if not await is_dj_logic(message, bot=self.cog.bot):
+            await message.channel.send(
+                embed=await self.cog.pylav.construct_embed(
+                    description=_("You need to be a disc jockey in this server to play tracks in this server."),
+                    messageable=message.channel,
+                ),
+                delete_after=10,
+            )
+            return None
+        if (player := self.cog.pylav.get_player(self.guild.id)) is None:
+            config = self.cog.pylav.player_config_manager.get_config(self.guild.id)
+            if (channel := self.guild.get_channel_or_thread(await config.fetch_forced_channel_id())) is None:
+                channel = rgetattr(message, "author.voice.channel", None)
+                if not channel:
+                    await message.channel.send(
+                        embed=await self.cog.pylav.construct_embed(
+                            messageable=self.channel,
+                            description=_("You must be in a voice channel, so I can connect to it."),
+                        ),
+                        delete_after=10,
+                    )
+                    return
+            if not ((permission := channel.permissions_for(self.guild.me)) and permission.connect and permission.speak):
+                await message.channel.send(
+                    embed=await self.cog.pylav.construct_embed(
+                        description=_(
+                            "I do not have permission to connect or speak in {channel_variable_do_not_translate}."
+                        ).format(channel_variable_do_not_translate=channel.mention),
+                        messageable=message.channel,
+                    ),
+                    delete_after=10,
+                )
+                return
+            player = await self.cog.pylav.player_manager.create(channel=channel)
+        return player
+
+    async def get_now_playing_embed(self, forced: bool = False) -> dict[str, discord.Embed | str | discord.File]:
+        await asyncio.sleep(1)
+        player = self.cog.pylav.get_player(self.guild.id)
+        if player is None or player.current is None or forced:
+            if self.__show_help:
+                footer_text = _(
+                    "\n\nYou can search specific services by using the following prefixes:\n"
+                    "{deezer_service_variable_do_not_translate}  - Deezer\n"
+                    "{spotify_service_variable_do_not_translate}  - Spotify\n"
+                    "{apple_music_service_variable_do_not_translate}  - Apple Music\n"
+                    "{youtube_music_service_variable_do_not_translate} - YouTube Music\n"
+                    "{youtube_service_variable_do_not_translate}  - YouTube\n"
+                    "{soundcloud_service_variable_do_not_translate}  - SoundCloud\n"
+                    "{yandex_music_service_variable_do_not_translate}  - Yandex Music\n"
+                    "Example: {example_variable_do_not_translate}.\n\n"
+                    "If no prefix is used I will default to {fallback_service_variable_do_not_translate}\n"
+                ).format(
+                    fallback_service_variable_do_not_translate=f"`{DEFAULT_SEARCH_SOURCE}:`",
+                    deezer_service_variable_do_not_translate="'dzsearch:' ",
+                    spotify_service_variable_do_not_translate="'spsearch:' ",
+                    apple_music_service_variable_do_not_translate="'amsearch:' ",
+                    youtube_music_service_variable_do_not_translate="'ytmsearch:'",
+                    youtube_service_variable_do_not_translate="'ytsearch:' ",
+                    soundcloud_service_variable_do_not_translate="'scsearch:' ",
+                    yandex_music_service_variable_do_not_translate="'ymsearch:' ",
+                    example_variable_do_not_translate=f"'{DEFAULT_SEARCH_SOURCE}:Hello Adele'",
+                )
+            else:
+                footer_text = None
+
+            return {
+                "embed": await self.cog.pylav.construct_embed(
+                    description=_("I am not currently playing anything on this server."),
+                    messageable=self.channel,
+                    footer=footer_text,
+                )
+            }
+        return await player.get_currently_playing_message(
+            embed=True, messageable=self.channel, progress=False, show_help=self.__show_help
+        )
+
+    async def update_view(self, forced: bool = False):
+        async with self.__update_view_lock:
+            await self.prepare()
+            kwargs = await self.get_now_playing_embed(forced)
+            attachments = []
+            if "file" in kwargs:
+                attachments = [kwargs.pop("file")]
+            elif "files" in kwargs:
+                attachments = kwargs.pop("files")
+            if attachments:
+                kwargs["attachments"] = attachments
+            await self.message.edit(view=self, **kwargs)
+
+    async def interaction_check(self, interaction: DISCORD_INTERACTION_TYPE, /) -> bool:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
+        if not await is_dj_logic(interaction):
+            await interaction.send(
+                embed=await interaction.client.pylav.construct_embed(
+                    description=_("You need to be a disc jockey to interact with the controller in this server."),
+                    messageable=interaction,
+                ),
+                ephemeral=True,
+            )
+            return False
+        if not (self.cog.pylav.get_player(self.channel.guild.id)):
+            await interaction.send(
+                embed=await interaction.client.pylav.construct_embed(
+                    description=_("I am not currently playing anything on this server."),
+                    messageable=interaction,
+                ),
+                ephemeral=True,
+            )
+            return False
+        return True
