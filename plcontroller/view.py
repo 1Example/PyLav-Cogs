@@ -182,16 +182,135 @@ class QueueHistoryButton(discord.ui.Button):
                 ),
                 ephemeral=True,
             )
-        from pylav.extension.red.ui.menus.queue import QueueMenu
         from pylav.extension.red.ui.sources.queue import QueueSource
 
-        await QueueMenu(
-            cog=self.cog,
+        command_cog = resolve_command_cog(self.cog)
+        menu_cls = get_controller_queue_menu()
+
+        await menu_cls(
+            cog=command_cog,
             bot=self.cog.bot,
-            source=QueueSource(guild_id=interaction.guild.id, cog=self.cog, history=True),
+            source=QueueSource(guild_id=interaction.guild.id, cog=command_cog, history=True),
             original_author=interaction.user,
             history=True,
         ).start(ctx=context)
+
+
+_CONTROLLER_QUEUE_MENU = None
+
+
+def resolve_command_cog(cog):
+    """Return the cog that actually owns the player commands.
+
+    PyLav's queue menu buttons call things like ``cog.command_skip`` and
+    ``cog.command_volume_change_by``. Those live on the PyLavPlayer (audio)
+    cog, not on PyLavController, so handing the menu ``self`` makes every
+    one of those buttons raise AttributeError. Hand it the audio cog
+    instead, falling back to the controller if audio isn't loaded.
+    """
+    return cog.bot.get_cog("PyLavPlayer") or cog
+
+
+def get_controller_queue_menu():
+    """Build (once) a QueueMenu restyled to match the controller panel.
+
+    Imported lazily because pylav's menu module pulls in the sources and
+    buttons packages, and importing those at module scope risks a circular
+    import during cog load.
+    """
+    global _CONTROLLER_QUEUE_MENU
+    if _CONTROLLER_QUEUE_MENU is not None:
+        return _CONTROLLER_QUEUE_MENU
+
+    from pylav.extension.red.ui.menus.queue import QueueMenu
+
+    class ControllerQueueMenu(QueueMenu):
+        """QueueMenu with the controller's transparent styling and grouping."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+            # Every button transparent, same as the controller panel.
+            for attribute in vars(self).values():
+                if isinstance(attribute, discord.ui.Button):
+                    attribute.style = TRANSPARENT
+
+            # Regroup to mirror the controller: playback first, then
+            # volume/repeat, then navigation, then queue management.
+            # prepare() places items by each button's row attribute, so
+            # reordering here needs no changes to prepare() itself.
+            for button, row in (
+                (self.previous_track_button, 0),
+                (self.paused_button, 0),
+                (self.resume_button, 0),
+                (self.skip_button, 0),
+                (self.shuffle_button, 0),
+                (self.stop_button, 0),
+                (self.decrease_volume_button, 1),
+                (self.increase_volume_button, 1),
+                (self.repeat_button_on, 1),
+                (self.repeat_button_off, 1),
+                (self.repeat_queue_button_on, 1),
+                (self.show_history_button, 1),
+                (self.refresh_button, 1),
+                (self.first_button, 2),
+                (self.backward_button, 2),
+                (self.forward_button, 2),
+                (self.last_button, 2),
+                (self.close_button, 2),
+                (self.enqueue_button, 3),
+                (self.remove_from_queue_button, 3),
+                (self.play_now_button, 3),
+                (self.clear_queue_button, 3),
+                (self.queue_disconnect, 3),
+            ):
+                button.row = row
+
+        def _display_order(self) -> list:
+            """Left-to-right order within each row, mirroring the panel."""
+            return [
+                self.previous_track_button,
+                self.paused_button,
+                self.resume_button,
+                self.skip_button,
+                self.shuffle_button,
+                self.stop_button,
+                self.decrease_volume_button,
+                self.increase_volume_button,
+                self.repeat_button_on,
+                self.repeat_button_off,
+                self.repeat_queue_button_on,
+                self.show_history_button,
+                self.refresh_button,
+                self.first_button,
+                self.backward_button,
+                self.forward_button,
+                self.last_button,
+                self.close_button,
+                self.enqueue_button,
+                self.remove_from_queue_button,
+                self.play_now_button,
+                self.clear_queue_button,
+                self.queue_disconnect,
+            ]
+
+        async def prepare(self):
+            await super().prepare()
+            # prepare() adds buttons in its own order, and discord.py keeps
+            # insertion order within a row. Re-sort so the row contents read
+            # the same way round as the controller panel. The sort is stable
+            # and keyed on the same attribute discord.py renders by, so
+            # anything unrecognised keeps its relative position at the end.
+            priority = {id(button): index for index, button in enumerate(self._display_order())}
+            self._children.sort(
+                key=lambda child: (
+                    getattr(child, "_rendered_row", None) or 0,
+                    priority.get(id(child), len(priority)),
+                )
+            )
+
+    _CONTROLLER_QUEUE_MENU = ControllerQueueMenu
+    return _CONTROLLER_QUEUE_MENU
 
 
 class QueueButton(discord.ui.Button):
@@ -222,13 +341,15 @@ class QueueButton(discord.ui.Button):
                 ),
                 ephemeral=True,
             )
-        from pylav.extension.red.ui.menus.queue import QueueMenu
         from pylav.extension.red.ui.sources.queue import QueueSource
 
-        await QueueMenu(
-            cog=self.cog,
+        command_cog = resolve_command_cog(self.cog)
+        menu_cls = get_controller_queue_menu()
+
+        await menu_cls(
+            cog=command_cog,
             bot=self.cog.bot,
-            source=QueueSource(guild_id=interaction.guild.id, cog=self.cog),
+            source=QueueSource(guild_id=interaction.guild.id, cog=command_cog),
             original_author=interaction.user,
         ).start(ctx=context)
 
