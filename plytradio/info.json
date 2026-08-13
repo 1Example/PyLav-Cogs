@@ -1,0 +1,35 @@
+{
+    "author": [
+        "Draper"
+    ],
+    "description": "Keeps the music going by queueing YouTube's recommended tracks (YouTube Mix / radio) when the queue runs empty. Unlike PyLav's built-in autoplay, the next track is seeded from whatever just finished playing rather than picked at random from a fixed playlist.",
+    "disabled": false,
+    "end_user_data_statement": "This cog stores per-guild settings and a short in-memory list of recently played track identifiers. Nothing is persisted about individual users.",
+    "hidden": false,
+    "install_msg": "Enable it per server with `[p]ytradio toggle true`.\nRequires a Lavalink node with a working YouTube source manager.",
+    "max_bot_version": "0.0.0",
+    "min_bot_version": "3.5.0.dev306",
+    "min_python_version": [
+        3,
+        11,
+        0
+    ],
+    "name": "PyLavYouTubeRadio",
+    "permissions": [
+        "embed_links"
+    ],
+    "required_cogs": {},
+    "requirements": [
+        "Py-Lav[all] @ git+https://github.com/1Example/PyLav@develop"
+    ],
+    "short": "YouTube recommendation-based autoplay for PyLav",
+    "tags": [
+        "audio",
+        "music",
+        "autoplay",
+        "radio",
+        "youtube",
+        "PyLav"
+    ],
+    "type": "COG"
+}
