@@ -12,7 +12,7 @@ from redbot.core.i18n import Translator, cog_i18n
 
 from pylav import logging
 from pylav.core.context import PyLavContext
-from pylav.events.track import TrackEndEvent
+from pylav.events.track import TrackEndEvent, TrackSkippedEvent, TrackStartEvent
 from pylav.players.player import Player
 from pylav.players.query.obj import Query
 from pylav.players.tracks.obj import Track
@@ -30,6 +30,10 @@ NATURAL_END_REASONS = {"finished", "FINISHED"}
 # How many seed video IDs we remember per guild so the radio doesn't loop
 # back onto the same handful of tracks.
 SEED_MEMORY = 200
+
+# Top the queue up once it drops to this many tracks. Keeping it low means
+# tracks the user queued themselves are left alone until they're nearly done.
+LOW_WATER_MARK = 1
 
 
 @cog_i18n(_)
@@ -170,11 +174,113 @@ class PyLavYouTubeRadio(DISCORD_COG_TYPE_MIXIN):
         return tracks
 
     # ------------------------------------------------------------------
-    # The actual hook
+    # Shared top-up logic
+    # ------------------------------------------------------------------
+
+    async def _top_up(self, player: Player, seed_track: Track | None, start_playback: bool) -> int:
+        """Fetch radio tracks seeded from ``seed_track`` and queue them.
+
+        Returns the number of tracks added.
+        """
+        guild_id = player.guild.id
+        if seed_track is None:
+            LOGGER.debug("Guild %s: no seed track available", guild_id)
+            return 0
+        if not player.is_connected:
+            LOGGER.debug("Guild %s: player disconnected", guild_id)
+            return 0
+
+        with contextlib.suppress(Exception):
+            if encoded := seed_track.encoded:
+                self._played[guild_id].append(encoded)
+
+        video_id = await self._youtube_id_for(seed_track)
+        if not video_id:
+            LOGGER.debug("Guild %s: could not resolve a YouTube seed", guild_id)
+            return 0
+
+        candidates = await self._fetch_mix(video_id, player)
+        if not candidates:
+            return 0
+
+        already_played = set(self._played[guild_id])
+        fresh = [t for t in candidates if getattr(t, "encoded", None) not in already_played]
+        # If the mix is entirely stuff we've heard, fall back to the raw
+        # list rather than going silent.
+        pool = fresh or candidates
+
+        target = max(1, await self.get_buffer(guild_id))
+        shortfall = max(1, target - player.queue.qsize())
+        chosen = pool[:shortfall]
+        if not chosen:
+            return 0
+
+        for track in chosen:
+            with contextlib.suppress(Exception):
+                if enc := getattr(track, "encoded", None):
+                    self._played[guild_id].append(enc)
+
+        requester = player.guild.me
+        await player.bulk_add(tracks_and_queries=chosen, requester=requester.id)
+
+        if start_playback and player.current is None:
+            await player.play(None, None, requester=requester)
+
+        LOGGER.debug("Guild %s: queued %s radio tracks", guild_id, len(chosen))
+        return len(chosen)
+
+    # ------------------------------------------------------------------
+    # Hooks
     # ------------------------------------------------------------------
 
     @commands.Cog.listener()
+    async def on_pylav_track_start_event(self, event: TrackStartEvent) -> None:
+        """Keep the queue topped up so it never actually runs dry.
+
+        This is what makes skip work. If we only reacted to the queue
+        emptying, skipping the last track would call next() on an empty
+        queue, which stops the player and reports the end reason as
+        STOPPED -- indistinguishable from the user pressing stop.
+        """
+        player: Player = event.player
+        if player is None or player.guild is None:
+            return
+        guild_id = player.guild.id
+
+        if not await self.is_enabled(guild_id):
+            return
+        # Only step in when the queue is nearly exhausted, so tracks the
+        # user queued themselves play through untouched.
+        if player.queue.qsize() > LOW_WATER_MARK:
+            return
+        if self._lock[guild_id].locked():
+            return
+
+        async with self._lock[guild_id]:
+            if player.queue.qsize() > LOW_WATER_MARK:
+                return
+            await self._top_up(player, player.current or event.track, start_playback=False)
+
+    @commands.Cog.listener()
+    async def on_pylav_track_skipped_event(self, event: TrackSkippedEvent) -> None:
+        """Safety net: a skip that emptied the player should not end the session."""
+        player: Player = event.player
+        if player is None or player.guild is None:
+            return
+        guild_id = player.guild.id
+
+        if not await self.is_enabled(guild_id):
+            return
+
+        async with self._lock[guild_id]:
+            if player.current is not None or not player.queue.empty():
+                return
+            LOGGER.debug("Guild %s: skip emptied the player, reloading radio", guild_id)
+            await self._top_up(player, event.track, start_playback=True)
+
+    @commands.Cog.listener()
     async def on_pylav_track_end_event(self, event: TrackEndEvent) -> None:
+        """Fallback for when a track finishes and nothing is left to play."""
         player: Player = event.player
         if player is None or player.guild is None:
             return
@@ -185,67 +291,14 @@ class PyLavYouTubeRadio(DISCORD_COG_TYPE_MIXIN):
             return
         if not await self.is_enabled(guild_id):
             return
-        LOGGER.debug("Radio hook fired in guild %s", guild_id)
 
         async with self._lock[guild_id]:
             # PyLav has already run next() by the time this fires. If
-            # something is playing or queued, the queue wasn't actually
-            # empty and we should stay out of the way.
+            # something is playing or queued, we should stay out of the way.
             if player.current is not None or not player.queue.empty():
-                LOGGER.debug(
-                    "Guild %s: something already playing or queued - built-in autoplay may be on",
-                    guild_id,
-                )
                 return
-            if not player.is_connected:
-                LOGGER.debug("Guild %s: player disconnected before radio could load", guild_id)
-                return
-
-            seed_track = event.track
-            if seed_track is None:
-                return
-
-            with contextlib.suppress(Exception):
-                encoded = seed_track.encoded
-                if encoded:
-                    self._played[guild_id].append(encoded)
-
-            video_id = await self._youtube_id_for(seed_track)
-            if not video_id:
-                LOGGER.debug("Could not resolve a YouTube seed for guild %s", guild_id)
-                return
-
-            candidates = await self._fetch_mix(video_id, player)
-            if not candidates:
-                LOGGER.debug("YouTube mix RD%s returned nothing", video_id)
-                return
-
-            already_played = set(self._played[guild_id])
-            fresh = [t for t in candidates if getattr(t, "encoded", None) not in already_played]
-            # If the mix is entirely stuff we've heard, fall back to the raw
-            # list rather than going silent.
-            pool = fresh or candidates
-
-            wanted = max(1, await self.get_buffer(guild_id))
-            chosen = pool[:wanted]
-            if not chosen:
-                return
-
-            requester = player.guild.me
-            for track in chosen:
-                with contextlib.suppress(Exception):
-                    if enc := getattr(track, "encoded", None):
-                        self._played[guild_id].append(enc)
-
-            await player.bulk_add(
-                tracks_and_queries=chosen,
-                requester=requester.id,
-            )
-
-            if player.current is None:
-                await player.play(None, None, requester=requester)
-
-            LOGGER.debug("Queued %s radio tracks in guild %s", len(chosen), guild_id)
+            LOGGER.debug("Guild %s: queue ran dry, reloading radio", guild_id)
+            await self._top_up(player, event.track, start_playback=True)
 
     # ------------------------------------------------------------------
     # Commands
