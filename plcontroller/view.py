@@ -27,9 +27,10 @@ TRANSPARENT = discord.ButtonStyle.secondary
 # the controller for ten minutes.
 QUEUE_MENU_TIMEOUT = 60
 
-# How long the ephemeral "I have skipped ..." style confirmations stay before
-# they are removed.
-EPHEMERAL_DELETE_AFTER = 5
+# How long confirmations ("I have skipped ...") stay in the channel before
+# they are deleted. These are public now, so they are visible to everyone and
+# are removed on this timer rather than lingering per-user.
+PUBLIC_DELETE_AFTER = 10
 
 # Queue-menu buttons that reply with an ephemeral confirmation. These all
 # defer with thinking=True, so their response is safe to delete. Navigation
@@ -55,6 +56,34 @@ CONFIRMING_BUTTONS = frozenset(
 )
 
 
+class PublicInteractionResponse:
+    """Wraps ``interaction.response`` to force replies out of ephemeral mode.
+
+    PyLav's queue-menu buttons hardcode ``defer(ephemeral=True, thinking=True)``.
+    Ephemeral messages cannot be deleted on a timer and are only ever visible
+    to the clicker, so they pile up in that person's view instead of being
+    cleaned up. ``Interaction.response`` is a cached-slot property, so the
+    cached value can be swapped for this proxy while the callback runs.
+    """
+
+    __slots__ = ("_response",)
+
+    def __init__(self, response):
+        self._response = response
+
+    def __getattr__(self, item):
+        return getattr(self._response, item)
+
+    async def defer(self, *args, **kwargs):
+        kwargs["ephemeral"] = False
+        return await self._response.defer(*args, **kwargs)
+
+    async def send_message(self, *args, **kwargs):
+        kwargs["ephemeral"] = False
+        result = await self._response.send_message(*args, **kwargs)
+        return result
+
+
 class AutoDeletingFollowup:
     """Wraps ``interaction.followup`` so ephemeral replies clean themselves up.
 
@@ -76,6 +105,7 @@ class AutoDeletingFollowup:
 
     async def send(self, *args, **kwargs):
         kwargs.setdefault("wait", True)
+        kwargs["ephemeral"] = False
         message = await self._webhook.send(*args, **kwargs)
         if message is not None:
             with contextlib.suppress(Exception):
@@ -100,7 +130,7 @@ class IncreaseVolumeButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await interaction.response.defer()
         context = await self.cog.bot.get_context(interaction)
         await self.cog.volume(context, change_by=5)
         await self.view.update_view()
@@ -118,7 +148,7 @@ class DecreaseVolumeButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await interaction.response.defer()
         context = await self.cog.bot.get_context(interaction)
         await self.cog.volume(context, change_by=-5)
         await self.view.update_view()
@@ -136,7 +166,7 @@ class StopTrackButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await interaction.response.defer()
         context = await self.cog.bot.get_context(interaction)
         await self.cog.stop(context)
         await self.view.update_view(forced=True)
@@ -154,7 +184,7 @@ class PauseTrackButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await interaction.response.defer()
         context = await self.cog.bot.get_context(interaction)
         await self.cog.pause(context)
         await self.view.update_view()
@@ -172,7 +202,7 @@ class ResumeTrackButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await interaction.response.defer()
         context = await self.cog.bot.get_context(interaction)
         await self.cog.resume(context)
         await self.view.update_view()
@@ -190,7 +220,7 @@ class SkipTrackButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await interaction.response.defer()
         context = await self.cog.bot.get_context(interaction)
         await self.cog.skip(context)
         await self.view.update_view()
@@ -208,7 +238,7 @@ class ToggleRepeatButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await interaction.response.defer()
         context = await self.cog.bot.get_context(interaction)
         player = context.player
         if not player:
@@ -216,7 +246,7 @@ class ToggleRepeatButton(discord.ui.Button):
                 embed=await self.cog.pylav.construct_embed(
                     description=_("I am not connected to any voice channel at the moment."), messageable=interaction
                 ),
-                ephemeral=True,
+                delete_after=PUBLIC_DELETE_AFTER,
             )
         await self.cog.repeat(context, queue=await player.config.fetch_repeat_current())
         await self.view.update_view()
@@ -234,14 +264,14 @@ class QueueHistoryButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await interaction.response.defer()
         context = await self.cog.bot.get_context(interaction)
         if not (__ := context.player):
             return await context.send(
                 embed=await self.cog.pylav.construct_embed(
                     description=_("I am not connected to any voice channel at the moment."), messageable=interaction
                 ),
-                ephemeral=True,
+                delete_after=PUBLIC_DELETE_AFTER,
             )
         from pylav.extension.red.ui.sources.queue import QueueSource
 
@@ -351,16 +381,21 @@ def get_controller_queue_menu():
 
             async def wrapped(interaction, *, _original=original):
                 real_followup = interaction.followup
+                real_response = interaction.response
                 with contextlib.suppress(Exception):
-                    interaction._cs_followup = AutoDeletingFollowup(real_followup, EPHEMERAL_DELETE_AFTER)
+                    interaction._cs_followup = AutoDeletingFollowup(real_followup, PUBLIC_DELETE_AFTER)
+                with contextlib.suppress(Exception):
+                    interaction._cs_response = PublicInteractionResponse(real_response)
                 try:
                     await _original(interaction)
                 finally:
                     with contextlib.suppress(Exception):
                         interaction._cs_followup = real_followup
-                    # If the reply landed on the original deferred response
-                    # rather than a followup, clear that too.
-                    asyncio.create_task(delete_response_later(interaction, EPHEMERAL_DELETE_AFTER))
+                    with contextlib.suppress(Exception):
+                        interaction._cs_response = real_response
+                    # If the reply landed on the deferred response rather than
+                    # a followup, clear that too.
+                    asyncio.create_task(delete_response_later(interaction, PUBLIC_DELETE_AFTER))
 
             wrapped.__plc_wrapped__ = True
             button.callback = wrapped
@@ -424,21 +459,21 @@ class QueueButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await interaction.response.defer()
         context = await self.cog.bot.get_context(interaction)
         if not (player := context.player):
             return await context.send(
                 embed=await self.cog.pylav.construct_embed(
                     description=_("I am not connected to any voice channel at the moment."), messageable=interaction
                 ),
-                ephemeral=True,
+                delete_after=PUBLIC_DELETE_AFTER,
             )
         if player.queue.empty():
             return await context.send(
                 embed=await self.cog.pylav.construct_embed(
                     description=_("There is nothing in the queue."), messageable=interaction
                 ),
-                ephemeral=True,
+                delete_after=PUBLIC_DELETE_AFTER,
             )
         from pylav.extension.red.ui.sources.queue import QueueSource
 
@@ -465,7 +500,7 @@ class ToggleRepeatQueueButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await interaction.response.defer()
         context = await self.cog.bot.get_context(interaction)
         player = context.player
         if not player:
@@ -473,7 +508,7 @@ class ToggleRepeatQueueButton(discord.ui.Button):
                 embed=await self.cog.pylav.construct_embed(
                     description=_("I am not connected to any voice channel at the moment."), messageable=interaction
                 ),
-                ephemeral=True,
+                delete_after=PUBLIC_DELETE_AFTER,
             )
         repeat_queue = bool(await player.config.fetch_repeat_current())
         await self.cog.repeat(context, queue=repeat_queue)
@@ -492,7 +527,7 @@ class ShuffleButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await interaction.response.defer()
         context = await self.cog.bot.get_context(interaction)
         await self.cog.shuffle(context)
         await self.view.update_view()
@@ -510,7 +545,7 @@ class PreviousTrackButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await interaction.response.defer()
         context = await self.cog.bot.get_context(interaction)
         await self.cog.previous(context)
         await self.view.update_view()
@@ -895,7 +930,7 @@ class PersistentControllerView(discord.ui.View):
                     description=_("You need to be a disc jockey to interact with the controller in this server."),
                     messageable=interaction,
                 ),
-                ephemeral=True,
+                delete_after=PUBLIC_DELETE_AFTER,
             )
             return False
         if not (self.cog.pylav.get_player(self.channel.guild.id)):
@@ -904,7 +939,7 @@ class PersistentControllerView(discord.ui.View):
                     description=_("I am not currently playing anything on this server."),
                     messageable=interaction,
                 ),
-                ephemeral=True,
+                delete_after=PUBLIC_DELETE_AFTER,
             )
             return False
         return True
