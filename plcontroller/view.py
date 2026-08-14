@@ -370,6 +370,36 @@ def get_controller_queue_menu():
                 if isinstance(attribute, discord.ui.Button):
                     self._wrap_for_auto_delete(attribute)
 
+            # The navigation buttons are already ButtonStyle.grey -- what makes
+            # them look blue is the emoji. Unicode glyphs render as coloured
+            # Twemoji regardless of button style, so swap them for plain text
+            # labels (and the refresh glyph for PyLav's monochrome custom one)
+            # to match the rest of the panel.
+            for button, label in (
+                (self.first_button, "\u00ab"),
+                (self.backward_button, "\u2039"),
+                (self.forward_button, "\u203a"),
+                (self.last_button, "\u00bb"),
+            ):
+                button.emoji = None
+                button.label = label
+            with contextlib.suppress(Exception):
+                self.refresh_button.emoji = emojis.UPDATE
+
+        async def send_initial_message(self, ctx):
+            """Send the menu publicly rather than ephemerally.
+
+            PyLav hardcodes ``ephemeral=True`` here. That has two costs: only
+            the person who clicked can see it, and on_timeout skips its own
+            ``message.delete()`` for ephemeral messages -- so the menu never
+            cleaned itself up either.
+            """
+            self.ctx = ctx
+            kwargs = await self.get_page(self.current_page)
+            await self.prepare()
+            self.message = await ctx.send(**kwargs, view=self)
+            return self.message
+
         @staticmethod
         def _wrap_for_auto_delete(button: discord.ui.Button) -> None:
             """Make a button's ephemeral confirmation delete itself shortly after."""
