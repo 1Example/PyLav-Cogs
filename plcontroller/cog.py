@@ -2,925 +2,589 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import datetime
-from collections import defaultdict
-from datetime import timedelta
-from functools import partial
+import inspect
+import random
+from collections import defaultdict, deque
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import discord
-from apscheduler.jobstores.base import JobLookupError
 from redbot.core import Config, commands
 from redbot.core.i18n import Translator, cog_i18n
-from redbot.core.utils.antispam import AntiSpam
-from redbot.core.utils.chat_formatting import humanize_number
 
-from plcontroller.view import PersistentControllerView
 from pylav import logging
 from pylav.core.context import PyLavContext
-from pylav.events.player import PlayerPausedEvent, PlayerResumedEvent, PlayerStoppedEvent
-from pylav.events.queue import QueueEndEvent
-from pylav.events.track import TrackStartEvent
-from pylav.helpers.time import get_now_utc
+from pylav.events.track import TrackEndEvent, TrackSkippedEvent, TrackStartEvent
 from pylav.players.player import Player
 from pylav.players.query.obj import Query
+from pylav.players.tracks.obj import Track
 from pylav.type_hints.bot import DISCORD_BOT_TYPE, DISCORD_COG_TYPE_MIXIN
 
-_ = Translator("PyLavController", Path(__file__))
+_ = Translator("PyLavYouTubeRadio", Path(__file__))
 
-LOGGER = logging.getLogger("red.PyLav.cog.Controller")
+LOGGER = logging.getLogger("red.PyLav.cog.YouTubeRadio")
+
+# Reasons that mean "the track played through to the end on its own".
+# Anything else (REPLACED, STOPPED, CLEANUP) means a human intervened,
+# and we must not hijack that.
+NATURAL_END_REASONS = {"finished", "FINISHED"}
+
+# How many seed video IDs we remember per guild so the radio doesn't loop
+# back onto the same handful of tracks.
+SEED_MEMORY = 200
+
+# How many alternate seeds to try when a mix runs out of unheard tracks.
+RESEED_ATTEMPTS = 4
+
+# Top the queue up once it drops to this many tracks. Keeping it low means
+# tracks the user queued themselves are left alone until they're nearly done.
+LOW_WATER_MARK = 1
 
 
 @cog_i18n(_)
-class PyLavController(
-    DISCORD_COG_TYPE_MIXIN,
-):
-    """Set a channel to listens and control the music player."""
+class PyLavYouTubeRadio(DISCORD_COG_TYPE_MIXIN):
+    """Keeps playing YouTube's recommended tracks when the queue runs dry.
+
+    Unlike PyLav's built-in autoplay, this seeds a YouTube Mix from the
+    track that just finished, so what plays next is related to what you
+    were actually listening to.
+    """
 
     __version__ = "1.0.0"
 
     def __init__(self, bot: DISCORD_BOT_TYPE, *args: Any, **kwargs: Any):
         super().__init__(*args, **kwargs)
         self.bot = bot
-        self._config = Config.get_conf(self, identifier=208903205982044161)
-        self.__lock: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self.__defaults = dict(
-            channel=None,
-            list_for_requests=False,
-            list_for_searches=False,
-            persistent_view_message_id=None,
-            enable_antispam=True,
-            use_slow_mode=True,
+        self._config = Config.get_conf(self, identifier=208903205982044162)
+        self._config.register_guild(
+            enabled=False,
+            buffer=3,
         )
-        self._config.register_guild(**self.__defaults)
-        self._config.register_global(
-            listen_to_any_message=False,
-        )
-        self._channel_cache: dict[int, int] = {}
-        self._list_for_search_cache: dict[int, bool] = defaultdict(lambda: self.__defaults["list_for_searches"])
-        self._list_for_command_cache: dict[int, bool] = defaultdict(lambda: self.__defaults["list_for_requests"])
-        self._enable_antispam_cache: dict[int, bool] = defaultdict(lambda: self.__defaults["enable_antispam"])
-        self._use_slow_mode_cache: dict[int, bool] = defaultdict(lambda: self.__defaults["use_slow_mode"])
-        self._view_cache: dict[int, PersistentControllerView] = {}
-        self.__failed_messages_to_delete: dict[int, set[discord.Message]] = defaultdict(set)
-        self.__success_messages_to_delete: dict[int, set[discord.Message]] = defaultdict(set)
-        self._greedy_cache = False
-        self.__ready = asyncio.Event()
-        intervals = [
-            (timedelta(minutes=1), 5),
-            (timedelta(hours=1), 50),
-        ]
-
-        self.antispam: dict[int, dict[int, AntiSpam]] = defaultdict(lambda: defaultdict(partial(AntiSpam, intervals)))
-
-    async def cog_check(self, context: PyLavContext) -> bool:
-        return self.__ready.is_set()
+        self._enabled_cache: dict[int, bool] = {}
+        self._buffer_cache: dict[int, int] = {}
+        # PyLav clears player.history when it stops on an empty queue, so we
+        # keep our own memory of what the radio has already served.
+        self._played: dict[int, deque[str]] = defaultdict(lambda: deque(maxlen=SEED_MEMORY))
+        # Video IDs we have already used as mix seeds, so reseeding keeps
+        # branching outward instead of circling back to the same mixes.
+        self._seeds: dict[int, deque[str]] = defaultdict(lambda: deque(maxlen=SEED_MEMORY))
+        self._lock: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     async def cog_unload(self) -> None:
-        self.bot.remove_listener(self.on_message)
-        self.bot.remove_listener(self.on_message_without_command)
-        for view in self._view_cache.values():
-            view.stop()
-        self._view_cache.clear()
-        with contextlib.suppress(JobLookupError):
-            self.pylav.scheduler.remove_job(f"{self.__class__.__name__}-{self.bot.user.id}-delete_failed_messages")
-        with contextlib.suppress(JobLookupError):
-            self.pylav.scheduler.remove_job(f"{self.__class__.__name__}-{self.bot.user.id}-delete_successful_messages")
+        self._played.clear()
+        self._seeds.clear()
 
-    async def initialize(self):
-        await self.pylav.wait_until_ready()
+    async def is_enabled(self, guild_id: int) -> bool:
+        if guild_id not in self._enabled_cache:
+            self._enabled_cache[guild_id] = await self._config.guild_from_id(guild_id).enabled()
+        return self._enabled_cache[guild_id]
 
-        guild_data = await self._config.all_guilds()
+    async def get_buffer(self, guild_id: int) -> int:
+        if guild_id not in self._buffer_cache:
+            self._buffer_cache[guild_id] = await self._config.guild_from_id(guild_id).buffer()
+        return self._buffer_cache[guild_id]
 
-        for guild_id, data in guild_data.items():
-            if channel_id := data["channel"]:
-                self._channel_cache[guild_id] = channel_id
-            self._list_for_command_cache[guild_id] = data["list_for_requests"]
-            self._list_for_search_cache[guild_id] = data["list_for_searches"]
-            self._enable_antispam_cache[guild_id] = data["enable_antispam"]
-            self._use_slow_mode_cache[guild_id] = data["use_slow_mode"]
-            if data["persistent_view_message_id"]:
-                if channel := self.bot.get_channel(channel_id):
-                    await self.prepare_channel(channel)
-        self.__ready.set()
-        self.pylav.scheduler.add_job(
-            self.delete_failed_messages,
-            trigger="interval",
-            seconds=5,
-            max_instances=1,
-            id=f"{self.__class__.__name__}-{self.bot.user.id}-delete_failed_messages",
-            replace_existing=True,
-            coalesce=True,
-            next_run_time=get_now_utc() + datetime.timedelta(seconds=5),
-        )
-        self.pylav.scheduler.add_job(
-            self.delete_successful_messages,
-            trigger="interval",
-            seconds=5,
-            max_instances=1,
-            id=f"{self.__class__.__name__}-{self.bot.user.id}-delete_successful_messages",
-            replace_existing=True,
-            coalesce=True,
-            next_run_time=get_now_utc() + datetime.timedelta(seconds=5),
-        )
-        if await self._config.listen_to_any_message():
-            self.bot.add_listener(self.on_message)
-        else:
-            self.bot.add_listener(self.on_message_without_command)
+    # ------------------------------------------------------------------
+    # Seed resolution
+    # ------------------------------------------------------------------
 
-    @commands.group(name="plcontrollerset")
-    @commands.guild_only()
-    @commands.admin_or_permissions(manage_guild=True)
-    async def command_plcontrollerset(self, context: PyLavContext):
-        """Configure the PyLav Controller."""
+    @staticmethod
+    def _extract_tracks(response: Any) -> list[Any]:
+        """Pull the track list out of a loadtracks response.
 
-    @command_plcontrollerset.command(name="channel")
-    async def command_plcontrollerset_channel(
-        self, context: PyLavContext, channel: discord.TextChannel | discord.Thread | discord.VoiceChannel
-    ):
-        """Set the channel to create the controller in."""
-        channel_permissions = channel.permissions_for(context.guild.me)
-        if not all(
-            [
-                channel_permissions.read_messages,
-                channel_permissions.manage_channels,
-                channel_permissions.manage_roles,
-                channel_permissions.send_messages,
-                channel_permissions.embed_links,
-                channel_permissions.add_reactions,
-                channel_permissions.external_emojis,
-                channel_permissions.manage_messages,
-                channel_permissions.manage_threads,
-                channel_permissions.read_message_history,
-            ]
-        ):
-            await context.send(
-                embed=await context.construct_embed(
-                    title=_(
-                        "I do not have the required permissions in {channel_name_variable_do_not_translate}."
-                    ).format(channel_name_variable_do_not_translate=channel.name),
-                    description=(
-                        "Please make sure I have the following permissions: "
-                        "`View Channel`, `Manage Channel`, `Manage Permissions`, "
-                        "`Send Messages`, `Embed Links`, `Add Reactions`, "
-                        "`Use External Emojis`, `Manage Messages`, `Manage Threads` and `Read Message History` "
-                        "in {channel_variable_do_not_translate}."
-                    ).format(channel_variable_do_not_translate=channel.mention),
-                    messageable=context,
-                )
-            )
-            return
+        PyLav's response objects changed shape between Lavalink v3 and v4:
 
-        await self._config.guild(context.guild).channel.set(channel.id)
-        self._channel_cache[context.guild.id] = channel.id
+          v3: TrackLoaded / PlaylistLoaded / SearchResult, all with .tracks
+          v4: TrackResponse / PlaylistResponse / SearchResponse, where the
+              payload lives under .data -- a list for searches, an object
+              with .tracks for playlists, a bare track for single loads.
 
-        await context.send(
-            embed=await context.construct_embed(
-                description=_(
-                    "I will now use {channel_name_variable_do_not_translate} for the controller functionality."
-                ).format(channel_name_variable_do_not_translate=channel.mention),
-                messageable=context,
-            ),
-            ephemeral=True,
-        )
-
-        await self.prepare_channel(channel)
-
-    @command_plcontrollerset.command(name="acceptrequests", aliases=["ar", "listen"])
-    async def command_plcontrollerset_acceptrequests(self, context: PyLavContext):
-        """Toggle whether the controller should listen for requests."""
-        if context.guild.id not in self._channel_cache or (
-            (channel_id := self._channel_cache[context.guild.id]) is None or channel_id not in self._view_cache
-        ):
-            await context.send(
-                embed=await context.construct_embed(
-                    description=_(
-                        "I am not set up for the controller channel yet, "
-                        "please run {setup_command_variable_do_not_translate} first."
-                    ).format(
-                        setup_command_variable_do_not_translate=f"`{context.clean_prefix}{self.command_plcontrollerset_channel.qualified_name}`"
-                    ),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-            return
-        current = await self._config.guild(context.guild).list_for_requests()
-        await self._config.guild(context.guild).list_for_requests.set(not current)
-        self._list_for_command_cache[context.guild.id] = not current
-
-        if not current:
-            await context.send(
-                embed=await context.construct_embed(
-                    description=_("From now on, I will accept user requests in the controller channel."),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-        else:
-            await context.send(
-                embed=await context.construct_embed(
-                    description=_("From now on, I will ignore user requests in the controller channel."),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-
-    @command_plcontrollerset.command(name="acceptsearches", aliases=["as", "search"])
-    async def command_plcontrollerset_acceptsearches(self, context: PyLavContext):
-        """Toggle whether the controller should listen for searches."""
-        if (channel_id := self._channel_cache.get(context.guild.id)) is None or channel_id not in self._view_cache:
-            await context.send(
-                embed=await context.construct_embed(
-                    description=_(
-                        "I am not set up for the controller channel yet, please run {setup_command_variable_do_not_translate} first."
-                    ).format(
-                        setup_command_variable_do_not_translate=f"`{context.clean_prefix}{self.command_plcontrollerset_channel.qualified_name}`"
-                    ),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-            return
-        current = await self._config.guild(context.guild).list_for_searches()
-        await self._config.guild(context.guild).list_for_searches.set(not current)
-        self._list_for_search_cache[context.guild.id] = not current
-        if channel := self.bot.get_channel(channel_id):
-            if not current:
-                self._view_cache[channel.id].enable_show_help()
-            else:
-                self._view_cache[channel.id].disable_show_help()
-
-        if not current:
-            await context.send(
-                embed=await context.construct_embed(
-                    description=_("From now on, I will accept user searches in the controller channel."),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-        else:
-            await context.send(
-                embed=await context.construct_embed(
-                    description=_("From now on, I will ignore user searches in the controller channel."),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-
-    @command_plcontrollerset.command(name="slowmode", aliases=["sm"])
-    async def command_plcontrollerset_slowmode(self, context: PyLavContext):
-        """Toggle whether the controller should use slowmode."""
-        if (channel_id := self._channel_cache.get(context.guild.id)) is None or channel_id not in self._view_cache:
-            await context.send(
-                embed=await context.construct_embed(
-                    description=_(
-                        "I am not set up for the controller channel yet, please run {setup_command_variable_do_not_translate} first."
-                    ).format(
-                        setup_command_variable_do_not_translate=f"`{context.clean_prefix}{self.command_plcontrollerset_channel.qualified_name}`"
-                    ),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-            return
-        current = await self._config.guild(context.guild).use_slow_mode()
-        await self._config.guild(context.guild).use_slow_mode.set(not current)
-        self._use_slow_mode_cache[context.guild.id] = not current
-        if channel := self.bot.get_channel(channel_id):
-            if not current:
-                await self._view_cache[channel.id].enable_slow_mode()
-            else:
-                await self._view_cache[channel.id].disable_slow_mode()
-        if not current:
-            await context.send(
-                embed=await context.construct_embed(
-                    description=_("From now on, I will use slowmode in the controller channel."),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-        else:
-            await context.send(
-                embed=await context.construct_embed(
-                    description=_("From now on, I will not use slowmode in the controller channel."),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-
-    @command_plcontrollerset.command(name="antispam", aliases=["spam"])
-    async def command_plcontrollerset_antispam(self, context: PyLavContext):
-        """Toggle whether the controller enable the antispam check."""
-        current = await self._config.guild(context.guild).enable_antispam()
-        await self._config.guild(context.guild).enable_antispam.set(not current)
-        self._enable_antispam_cache[context.guild.id] = not current
-
-        if not current:
-            await context.send(
-                embed=await context.construct_embed(
-                    description=_("From now on, I will check user request against the antispam to avoid abuse."),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-        else:
-            await context.send(
-                embed=await context.construct_embed(
-                    description=_(
-                        "From now on, I will no longer check user request against the antispam to avoid abuse."
-                    ),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-
-    @commands.is_owner()
-    @command_plcontrollerset.command(name="greedy", aliases=["g"])
-    async def command_plcontrollerset_greedy(self, context: PyLavContext):
-        """Toggles whether I should listen to any message I see or only messages starting without a command prefix."""
-
-        self._greedy_cache = not self._greedy_cache
-        await self._config.listen_to_any_message.set(self._greedy_cache)
-
-        if self._greedy_cache:
-            await context.send(
-                embed=await context.construct_embed(
-                    description=_("From now on, I will listen to any message I see."),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-            self.bot.remove_listener(self.on_message_without_command)
-            self.bot.add_listener(self.on_message)
-        else:
-            await context.send(
-                embed=await context.construct_embed(
-                    description=_("From now on, I will only listen to messages starting without a command prefix."),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-            self.bot.remove_listener(self.on_message)
-            self.bot.add_listener(self.on_message_without_command)
-
-    async def volume(self, context: PyLavContext, change_by: int):
-        if isinstance(context, discord.Interaction):
-            context = await self.bot.get_context(context)
-        if context.interaction and not context.interaction.response.is_done():
-            await context.defer(ephemeral=True)
-        if not context.player:
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("I am not connected to a voice channel."), messageable=context
-                ),
-                ephemeral=True,
-            )
-            return
-        max_volume = await self.pylav.player_config_manager.get_max_volume(context.guild.id)
-        new_vol = context.player.volume + change_by
-        if new_vol > max_volume:
-            await context.player.set_volume(max_volume, requester=context.author)
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_(
-                        "Volume limit reached, player volume set to {volume_variable_do_not_translate}%."
-                    ).format(volume_variable_do_not_translate=humanize_number(context.player.volume)),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-        elif new_vol < 0:
-            await context.player.set_volume(0, requester=context.author)
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("Minimum volume reached, player volume set to 0%."), messageable=context
-                ),
-                ephemeral=True,
-            )
-        else:
-            await context.player.set_volume(new_vol, requester=context.author)
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("Player volume set to {volume_variable_do_not_translate}%").format(
-                        volume_variable_do_not_translate=new_vol
-                    ),
-                    messageable=context,
-                ),
-                ephemeral=True,
-            )
-
-    async def repeat(self, context: PyLavContext, queue: bool | None = None):
-        """Set whether to repeat the current song or queue.
-
-        If no argument is given, the current repeat mode will be toggled between the current track and off.
+        This handles both so the cog doesn't break on a PyLav update.
         """
-        if isinstance(context, discord.Interaction):
-            context = await self.bot.get_context(context)
-        if context.interaction and not context.interaction.response.is_done():
-            await context.defer(ephemeral=True)
-        if not context.player:
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("I am not currently playing anything on this server."), messageable=context
-                ),
-                ephemeral=True,
-            )
-            return
+        if not response:
+            return []
 
-        if queue:
-            await context.player.set_repeat("queue", True, context.author)
-            msg = _("From now on, I will now repeat the entire queue.")
-        elif await context.player.is_repeating():
-            await context.player.set_repeat("disable", False, context.author)
-            msg = _("From now on, I will no longer repeat any tracks.")
-        else:
-            await context.player.set_repeat("current", True, context.author)
-            if context.player.current:
-                msg = _("From now on, I will now repeat {track_name_variable_do_not_translate}.").format(
-                    track_name_variable_do_not_translate=await context.player.current.get_track_display_name(
-                        with_url=True
-                    )
-                )
-            else:
-                msg = _("From now on, I will now repeat the current track.")
-        await context.send(
-            embed=await context.pylav.construct_embed(description=msg, messageable=context), ephemeral=True
-        )
+        # v3 shape, and v4 responses that still expose a flat list.
+        tracks = getattr(response, "tracks", None)
+        if tracks:
+            return list(tracks)
 
-    async def shuffle(self, context: PyLavContext):
-        """Shuffles the current queue."""
-        if isinstance(context, discord.Interaction):
-            context = await self.bot.get_context(context)
-        if context.interaction and not context.interaction.response.is_done():
-            await context.defer(ephemeral=True)
-        if not context.player:
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("I am not currently playing anything on this server."), messageable=context
-                ),
-                ephemeral=True,
-            )
-            return
-        if context.player.queue.empty():
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("The server queue is currently empty."), messageable=context
-                ),
-                ephemeral=True,
-            )
-            return
-        if (await self.pylav.player_config_manager.get_shuffle(context.guild.id)) is False:
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("You are not allowed to shuffle the queue."), messageable=context
-                ),
-                ephemeral=True,
-            )
-            return
-        await context.player.shuffle_queue(context.author.id)
-        await context.send(
-            embed=await context.pylav.construct_embed(
-                description=_("{queue_size_variable_do_not_translate} tracks shuffled.").format(
-                    queue_size_variable_do_not_translate=context.player.queue.size()
-                ),
-                messageable=context,
-            ),
-            ephemeral=True,
-        )
+        data = getattr(response, "data", None)
+        if data is None:
+            return []
+        if isinstance(data, list):
+            return list(data)
 
-    async def skip(self, context: PyLavContext):
-        """Skips the current track."""
-        if isinstance(context, discord.Interaction):
-            context = await self.bot.get_context(context)
-        if context.interaction and not context.interaction.response.is_done():
-            await context.defer(ephemeral=True)
+        nested = getattr(data, "tracks", None)
+        if nested:
+            return list(nested)
 
-        if not context.player or (not context.player.current and not context.player.autoplay_enabled):
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("I am not currently playing anything on this server."), messageable=context
-                ),
-                ephemeral=True,
-            )
-            return
-        if context.player.current:
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("I have skipped {track_name_variable_do_not_translate} as requested.").format(
-                        track_name_variable_do_not_translate=await context.player.current.get_track_display_name(
-                            with_url=True
-                        )
-                    ),
-                    thumbnail=await context.player.current.artworkUrl(),
-                    messageable=context,
-                ),
-                ephemeral=True,
-                file=await context.player.current.get_embedded_artwork(),
-            )
-        await context.player.skip(requester=context.author)
+        # Single track load: data is the track itself.
+        if getattr(data, "encoded", None) or getattr(data, "info", None):
+            return [data]
+        return []
 
-    async def resume(self, context: PyLavContext):
-        """Resume the player"""
-        if isinstance(context, discord.Interaction):
-            context = await self.bot.get_context(context)
-        if context.interaction and not context.interaction.response.is_done():
-            await context.defer(ephemeral=True)
-        if not context.player:
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("I am not currently playing anything on this server."), messageable=context
-                ),
-                ephemeral=True,
-            )
-            return
-        if not context.player.paused:
-            description = _("The player already resumed")
-            await context.send(
-                embed=await context.pylav.construct_embed(description=description, messageable=context),
-                ephemeral=True,
-            )
-            return
+    @classmethod
+    def _unique(cls, tracks: list[Any]) -> list[Any]:
+        """Drop duplicates while preserving order -- mixes can list a song twice."""
+        seen: set[str] = set()
+        out = []
+        for track in tracks:
+            key = cls._track_key(track)
+            if key is None or key in seen:
+                continue
+            seen.add(key)
+            out.append(track)
+        return out
 
-        await context.player.set_pause(False, context.author)
-        await context.send(
-            embed=await context.pylav.construct_embed(
-                description=_("I have now resumed the player as requested."), messageable=context
-            ),
-            ephemeral=True,
-        )
+    @staticmethod
+    def _track_key(track: Any) -> str | None:
+        """Stable identity for a track, used for de-duplication.
 
-    async def pause(self, context: PyLavContext):
-        """Pause the player"""
-        if isinstance(context, discord.Interaction):
-            context = await self.bot.get_context(context)
-        if context.interaction and not context.interaction.response.is_done():
-            await context.defer(ephemeral=True)
-        if not context.player:
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("I am not currently playing anything on this server."), messageable=context
-                ),
-                ephemeral=True,
-            )
-            return
-        if context.player.paused:
-            description = _("The player is already paused.")
-            await context.send(
-                embed=await context.pylav.construct_embed(description=description, messageable=context),
-                ephemeral=True,
-            )
-            return
-
-        await context.player.set_pause(True, requester=context.author)
-        await context.send(
-            embed=await context.pylav.construct_embed(
-                description=_("I have now paused the player as requested."), messageable=context
-            ),
-            ephemeral=True,
-        )
-
-    async def stop(self, context: PyLavContext):
-        """Stops the player and clears the queue."""
-        if isinstance(context, discord.Interaction):
-            context = await self.bot.get_context(context)
-        if context.interaction and not context.interaction.response.is_done():
-            await context.defer(ephemeral=True)
-        if not context.player or not context.player.current:
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("I am not currently playing anything on this server."), messageable=context
-                ),
-                ephemeral=True,
-            )
-            return
-        await context.player.stop(context.author)
-        await context.send(
-            embed=await context.pylav.construct_embed(
-                description=_("I have stopped the playback and cleared the queue as requested."), messageable=context
-            ),
-            ephemeral=True,
-        )
-
-    async def previous(self, context: PyLavContext):
-        """Play previously played tracks.
-
-        A history of the last 100 tracks played is kept.
+        The video identifier is far more reliable than the encoded blob:
+        encoded strings carry position and version data, so the same song
+        fetched twice can produce two different strings and slip past a
+        de-dupe keyed on them.
         """
-        if isinstance(context, discord.Interaction):
-            context = await self.bot.get_context(context)
-        if context.interaction and not context.interaction.response.is_done():
-            await context.defer(ephemeral=True)
+        info = getattr(track, "info", None)
+        identifier = getattr(info, "identifier", None)
+        if identifier:
+            return identifier
+        with contextlib.suppress(Exception):
+            if encoded := getattr(track, "encoded", None):
+                return encoded
+        return None
 
-        if not context.player:
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("I am not currently playing anything on this server."), messageable=context
-                ),
-                ephemeral=True,
+    @staticmethod
+    async def _resolve(value):
+        """Return a value whether the accessor was sync or async.
+
+        PyLav has moved some Track accessors between coroutines and plain
+        properties across versions. Awaiting a plain string raises, and that
+        exception was being swallowed -- leaving the key empty, which silently
+        disabled de-duplication and let the playing track be queued again.
+        """
+        if inspect.isawaitable(value):
+            return await value
+        return value
+
+    async def _seed_key(self, track: Track) -> str | None:
+        """Stable identity for a live player track."""
+        for accessor in ("identifier", "encoded"):
+            try:
+                attribute = getattr(track, accessor, None)
+                if attribute is None:
+                    continue
+                value = attribute() if callable(attribute) else attribute
+                if resolved := await self._resolve(value):
+                    return resolved
+            except Exception:  # noqa: BLE001 - try the next accessor
+                continue
+        return None
+
+    async def _youtube_id_for(self, track: Track) -> str | None:
+        """Return a YouTube video ID to seed the mix from.
+
+        YouTube tracks hand us their identifier directly. Anything else
+        (Spotify, Deezer, Apple Music) has no video ID, so we resolve it by
+        searching YouTube for the title and artist and taking the top hit.
+        """
+        with contextlib.suppress(Exception):
+            source = await self._resolve(track.source() if callable(track.source) else track.source)
+            identifier = await self._seed_key(track)
+            if source and "youtube" in source.lower() and identifier:
+                return identifier
+
+        try:
+            title = await self._resolve(track.title() if callable(track.title) else track.title)
+            author = await self._resolve(track.author() if callable(track.author) else track.author)
+        except Exception:
+            LOGGER.debug("Could not read metadata off the finished track")
+            return None
+
+        terms = " ".join(part for part in (title, author) if part).strip()
+        if not terms:
+            return None
+
+        query = await Query.from_string(f"ytsearch:{terms}")
+        # get_tracks drops search results unless fullsearch is True --
+        # the branch is `fullsearch and is_search or is_single`, and a
+        # search query is not is_single, so False here returns nothing.
+        response = await self.pylav.get_tracks(query, fullsearch=True)
+        results = self._extract_tracks(response)
+        if not results:
+            LOGGER.debug("No YouTube match found for %s", terms)
+            return None
+
+        candidate = await Track.build_track(
+            node=await self.pylav.node_manager.find_best_node(),
+            data=results[0],
+            query=None,
+            requester=self.bot.user.id,
+        )
+        with contextlib.suppress(Exception):
+            return await candidate.identifier()
+        return None
+
+    async def _fetch_mix(self, video_id: str, player: Player) -> list[Any]:
+        """Load a YouTube Mix (radio) playlist seeded from a video ID."""
+        url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+        query = await Query.from_string(url)
+        response = await self.pylav.get_tracks(query, player=player)
+        tracks = self._extract_tracks(response)
+        if not tracks:
+            LOGGER.debug(
+                "Mix RD%s returned no usable tracks (response type: %s)",
+                video_id,
+                type(response).__name__,
             )
-            return
+        return tracks
 
-        if context.player.history.empty():
-            await context.send(
-                embed=await context.pylav.construct_embed(
-                    description=_("The history of tracks is currently empty."), messageable=context
-                ),
-                ephemeral=True,
-            )
-            return
-        await context.player.previous(requester=context.author)
-        await context.send(
-            embed=await context.pylav.construct_embed(
-                description=_("Playing previous track: {track_name_variable_do_not_translate}.").format(
-                    track_name_variable_do_not_translate=await context.player.current.get_track_display_name(
-                        with_url=True
-                    )
-                ),
-                thumbnail=await context.player.current.artworkUrl(),
-                messageable=context,
-            ),
-            ephemeral=True,
-            file=await context.player.current.get_embedded_artwork(),
-        )
+    # ------------------------------------------------------------------
+    # Shared top-up logic
+    # ------------------------------------------------------------------
 
-    async def prepare_channel(self, channel: discord.TextChannel | discord.Thread | discord.VoiceChannel):
-        permissions = channel.permissions_for(channel.guild.me)
-        if not all(
-            [
-                permissions.read_messages,
-                permissions.manage_channels,
-                permissions.manage_roles,
-                permissions.send_messages,
-                permissions.embed_links,
-                permissions.add_reactions,
-                permissions.external_emojis,
-                permissions.manage_messages,
-                permissions.manage_threads,
-                permissions.read_message_history,
-            ]
-        ):
-            await channel.send(
-                embed=await self.pylav.construct_embed(
-                    title=_("I do not have the required permissions in this channel."),
-                    description=_(
-                        "Please make sure I have the following permissions: "
-                        "`View Channel`, `Manage Channel`, `Manage Permissions`, "
-                        "`Send Messages`, `Embed Links`, `Add Reactions`, "
-                        "`Use External Emojis`, `Manage Messages`, `Manage Threads` and `Read Message History`. "
-                        "Once you give me these permissions, run {command_variable_do_not_edit}."
-                    ).format(
-                        command_variable_do_not_edit=f"`{(await self.bot.get_valid_prefixes(channel.guild))[0]}{self.command_plcontrollerset_channel.qualified_name}`"
-                    ),
-                    messageable=channel,
-                )
-            )
-            return
-        existing_view_id = await self._config.guild(channel.guild).persistent_view_message_id()
-        if existing_view_id:
-            with contextlib.suppress(discord.NotFound):
-                existing_view = await channel.fetch_message(existing_view_id)
-                self._view_cache[channel.id] = PersistentControllerView(
-                    cog=self, channel=channel, message=existing_view
-                )
-                await self._view_cache[channel.id].set_permissions()
-                await self._view_cache[channel.id].prepare()
-                if channel.guild.id in self._list_for_search_cache and self._list_for_search_cache[channel.guild.id]:
-                    self._view_cache[channel.id].enable_show_help()
-                self.bot.add_view(self._view_cache[channel.id], message_id=existing_view_id)
-                if self._use_slow_mode_cache[channel.guild.id]:
-                    await self._view_cache[channel.id].enable_slow_mode()
-                else:
-                    await self._view_cache[channel.id].disable_slow_mode()
-                return
-        self._view_cache[channel.id] = PersistentControllerView(cog=self, channel=channel)
-        await self._view_cache[channel.id].prepare()
-        await self._view_cache[channel.id].set_permissions()
-        if channel.guild.id in self._list_for_search_cache and self._list_for_search_cache[channel.guild.id]:
-            self._view_cache[channel.id].enable_show_help()
-        message = await self.send_channel_view(channel)
-        await self._config.guild(channel.guild).persistent_view_message_id.set(message.id)
-        self._view_cache[channel.id].set_message(message)
-        self.bot.add_view(self._view_cache[channel.id], message_id=message.id)
-        if self._use_slow_mode_cache[channel.guild.id]:
-            await self._view_cache[channel.id].enable_slow_mode()
-        else:
-            await self._view_cache[channel.id].disable_slow_mode()
+    async def _top_up(self, player: Player, seed_track: Track | None, start_playback: bool) -> int:
+        """Fetch radio tracks seeded from ``seed_track`` and queue them.
 
-    async def send_channel_view(
-        self, channel: discord.TextChannel | discord.Thread | discord.VoiceChannel
-    ) -> discord.Message:
-        return await channel.send(
-            view=self._view_cache[channel.id], **(await self._view_cache[channel.id].get_now_playing_embed())
-        )
+        Returns the number of tracks added.
+        """
+        guild_id = player.guild.id
+        if seed_track is None:
+            LOGGER.debug("Guild %s: no seed track available", guild_id)
+            return 0
+        if not player.is_connected:
+            LOGGER.debug("Guild %s: player disconnected", guild_id)
+            return 0
 
-    async def on_message(self, message: discord.Message):
-        guild = message.guild
-        if guild is None:
-            return
+        with contextlib.suppress(Exception):
+            if key := await self._seed_key(seed_track):
+                self._played[guild_id].append(key)
 
-        if message.author.bot:
-            return
+        video_id = await self._youtube_id_for(seed_track)
+        if not video_id:
+            LOGGER.debug("Guild %s: could not resolve a YouTube seed", guild_id)
+            return 0
 
-        if guild.id not in self._channel_cache:
-            return
+        candidates = await self._fetch_mix(video_id, player)
+        if not candidates:
+            return 0
 
-        if message.channel.id != self._channel_cache[guild.id]:
-            return
+        played = set(self._played[guild_id])
+        # Also exclude anything sitting in the queue right now, otherwise a
+        # mix that lists the same song twice can queue it twice.
+        # These are live pylav Track objects whose identifier() is async, so
+        # they need awaiting -- comparing raw encoded blobs against the
+        # identifiers used everywhere else silently matches nothing.
+        queued: set[str] = set()
+        with contextlib.suppress(Exception):
+            for entry in list(player.queue.raw_queue):
+                if key := await self._seed_key(entry):
+                    queued.add(key)
+        if player.current is not None:
+            with contextlib.suppress(Exception):
+                if key := await self._seed_key(player.current):
+                    queued.add(key)
 
-        channel = self.bot.get_channel(self._channel_cache[guild.id])
-        if channel is None:
-            return
+        excluded = played | queued
+        fresh = self._unique([t for t in candidates if self._track_key(t) not in excluded])
 
-        if channel.id not in self._view_cache:
-            return
+        # A YouTube mix is a fixed pool of roughly 25 tracks, and seeding it
+        # from a song that is itself in that mix returns much the same list.
+        # Once we have heard all of them, branch onto a different mix rather
+        # than replaying what just went by.
+        if not fresh:
+            LOGGER.debug("Guild %s: mix RD%s exhausted, reseeding", guild_id, video_id)
+            fresh, candidates = await self._reseed(player, candidates, excluded)
 
-        if await self.bot.cog_disabled_in_guild(self, guild):
-            return
+        pool = fresh or self._unique(candidates)
+        if not fresh:
+            LOGGER.debug("Guild %s: no fresh tracks anywhere, allowing repeats", guild_id)
 
-        if (await self.bot.get_context(message)).valid:
-            await self.__add_failed_message_to_delete(message)
-            return
+        target = max(1, await self.get_buffer(guild_id))
+        # Never force a minimum of one here. With buffer=1 the queue already
+        # holds its target after a single top-up, and max(1, ...) would add
+        # another track anyway on every track start -- that is the doubling.
+        shortfall = target - player.queue.qsize()
+        if shortfall <= 0:
+            LOGGER.debug("Guild %s: queue already at target (%s)", guild_id, target)
+            return 0
+        # Random rather than the first N: taking the head of the list every
+        # time makes the radio walk the same few tracks in the same order.
+        chosen = random.sample(pool, min(shortfall, len(pool)))
+        if not chosen:
+            return 0
 
-        async with self.__lock[message.guild.id]:
-            player = await self._view_cache[channel.id].get_player(message)
-        if player is None:
-            await self.add_failure_reaction(message)
-            return
+        for track in chosen:
+            if key := self._track_key(track):
+                self._played[guild_id].append(key)
 
-        await self.process_potential_query(message, player)
+        requester = player.guild.me
+        await player.bulk_add(tracks_and_queries=chosen, requester=requester.id)
 
-    async def on_message_without_command(self, message: discord.Message):
-        guild = message.guild
-        if guild is None:
-            return
+        if start_playback and player.current is None:
+            await player.play(None, None, requester=requester)
 
-        if message.author.bot:
-            return
+        LOGGER.debug("Guild %s: queued %s radio tracks", guild_id, len(chosen))
+        return len(chosen)
 
-        if guild.id not in self._channel_cache:
-            return
+    async def _reseed(self, player: Player, candidates: list[Any], played: set[str]) -> tuple[list[Any], list[Any]]:
+        """Branch onto a different YouTube mix when the current one is used up.
 
-        if message.channel.id != self._channel_cache[guild.id]:
-            return
+        Picks a track from the exhausted mix that we have not already seeded
+        from and fetches its mix instead. Returns (fresh, candidates).
+        """
+        guild_id = player.guild.id
+        seeds_tried = self._seeds[guild_id]
 
-        channel = self.bot.get_channel(self._channel_cache[guild.id])
-        if channel is None:
-            return
+        options = [t for t in candidates if (k := self._track_key(t)) and k not in seeds_tried]
+        random.shuffle(options)
 
-        if channel.id not in self._view_cache:
-            return
+        for alternate in options[:RESEED_ATTEMPTS]:
+            key = self._track_key(alternate)
+            seeds_tried.append(key)
+            more = await self._fetch_mix(key, player)
+            if not more:
+                continue
+            fresh = [t for t in more if self._track_key(t) not in played]
+            if fresh:
+                LOGGER.debug("Guild %s: reseeded onto mix RD%s (%s fresh)", guild_id, key, len(fresh))
+                return fresh, more
 
-        if await self.bot.cog_disabled_in_guild(self, guild):
-            return
-        async with self.__lock[message.guild.id]:
-            player = await self._view_cache[channel.id].get_player(message)
-        if player is None:
-            await self.add_failure_reaction(message)
-            return
+        return [], candidates
 
-        await self.process_potential_query(message, player)
-
-    async def process_potential_query(self, message: discord.Message, player: Player):
-        if (message.guild.id not in self._list_for_command_cache) or (
-            self._list_for_command_cache[message.guild.id] is False
-        ):
-            await self.add_failure_reaction(message)
-            return
-
-        if message.guild.id in self._enable_antispam_cache and self._enable_antispam_cache[message.guild.id]:
-            if self.antispam[message.guild.id][message.author.id].spammy:
-                await self.add_failure_reaction(message)
-                return
-            self.antispam[message.guild.id][message.author.id].stamp()
-
-        query = await Query.from_string(
-            message.clean_content, dont_search=not self._list_for_search_cache[message.guild.id]
-        )
-        if query.invalid:
-            await self.add_failure_reaction(message)
-            return
-        if query.is_search and not self._list_for_search_cache[message.guild.id]:
-            await self.add_failure_reaction(message)
-            return
-
-        successful, count, failed = await self.pylav.get_all_tracks_for_queries(
-            query, player=player, requester=message.author
-        )
-
-        if successful:
-            if query.is_search:
-                successful = [successful[0]]
-            await player.bulk_add(tracks_and_queries=successful, requester=message.author.id)
-            if (not player.is_active) and player.queue.size() > 0:
-                await player.next(requester=message.author)
-            await self.add_success_reaction(message)
-        else:
-            await self.add_failure_reaction(message)
-
-    async def red_delete_data_for_user(
-        self,
-        *,
-        requester: Literal["discord_deleted_user", "owner", "user", "user_strict"],
-        user_id: int,
-    ) -> None:
-        await self._config.user_from_id(user_id).clear()
+    # ------------------------------------------------------------------
+    # Hooks
+    # ------------------------------------------------------------------
 
     @commands.Cog.listener()
     async def on_pylav_track_start_event(self, event: TrackStartEvent) -> None:
-        await self.process_event(event)
+        """Keep the queue topped up so it never actually runs dry.
 
-    @commands.Cog.listener()
-    async def on_pylav_queue_end_event(self, event: QueueEndEvent) -> None:
-        await self.process_event(event)
-
-    @commands.Cog.listener()
-    async def on_pylav_player_stopped_event(self, event: PlayerStoppedEvent) -> None:
-        await self.process_event(event)
-
-    @commands.Cog.listener()
-    async def on_pylav_player_paused_event(self, event: PlayerPausedEvent) -> None:
-        await self.process_event(event)
-
-    @commands.Cog.listener()
-    async def on_pylav_player_resumed_event(self, event: PlayerResumedEvent) -> None:
-        await self.process_event(event)
-
-    async def process_event(
-        self, event: TrackStartEvent | QueueEndEvent | PlayerStoppedEvent | PlayerPausedEvent | PlayerResumedEvent
-    ) -> None:
-        await asyncio.sleep(1)
-        guild = event.player.guild
-        if guild.id not in self._channel_cache:
+        This is what makes skip work. If we only reacted to the queue
+        emptying, skipping the last track would call next() on an empty
+        queue, which stops the player and reports the end reason as
+        STOPPED -- indistinguishable from the user pressing stop.
+        """
+        player: Player = event.player
+        if player is None or player.guild is None:
             return
-        channel = self.bot.get_channel(self._channel_cache[guild.id])
-        if channel is None:
-            return
-        if channel.id not in self._view_cache:
-            return
-        if await self.bot.cog_disabled_in_guild(self, channel.guild):
-            return
-        await self._view_cache[channel.id].update_view()
+        guild_id = player.guild.id
 
-    async def __add_failed_message_to_delete(self, message: discord.Message) -> None:
-        async with self.__lock[message.guild.id]:
-            self.__failed_messages_to_delete[message.guild.id].add(message)
+        if not await self.is_enabled(guild_id):
+            return
+        # Only step in when the queue is nearly exhausted, so tracks the
+        # user queued themselves play through untouched.
+        if player.queue.qsize() > LOW_WATER_MARK:
+            return
+        if self._lock[guild_id].locked():
+            return
 
-    async def __copy_failed_message_to_delete(self, guild_id: int) -> set[discord.Message]:
-        async with self.__lock[guild_id]:
-            now = get_now_utc()
-            r = {m for m in self.__failed_messages_to_delete[guild_id] if m.created_at + timedelta(seconds=10) < now}
-            remaining = self.__failed_messages_to_delete[guild_id] - r
-            self.__failed_messages_to_delete[guild_id] = remaining
-            return r
-
-    async def delete_failed_messages(self) -> None:
-        await self.__ready.wait()
-        for guild_id in self.__failed_messages_to_delete:
-            if self.bot.get_guild(guild_id) is None:
-                self.__failed_messages_to_delete.pop(guild_id, None)
-                continue
-            channel = self.bot.get_channel(self._channel_cache[guild_id])
-            if channel is None:
+        async with self._lock[guild_id]:
+            if player.queue.qsize() > LOW_WATER_MARK:
                 return
-            messages = list(await self.__copy_failed_message_to_delete(guild_id))
-            for chunk in [messages[i : i + 100] for i in range(0, len(messages), 100)]:
-                await channel.delete_messages(chunk, reason=_("PyLavController: Deleting failed messages is channel"))
+            await self._top_up(player, player.current or event.track, start_playback=False)
 
-    async def add_failure_reaction(self, message: discord.Message) -> None:
-        await self.__add_failed_message_to_delete(message)
-        with contextlib.suppress(discord.HTTPException):
-            await message.add_reaction("\N{CROSS MARK}")
+    @commands.Cog.listener()
+    async def on_pylav_track_skipped_event(self, event: TrackSkippedEvent) -> None:
+        """Safety net: a skip that emptied the player should not end the session."""
+        player: Player = event.player
+        if player is None or player.guild is None:
+            return
+        guild_id = player.guild.id
 
-    async def __add_successful_message_to_delete(self, message: discord.Message) -> None:
-        async with self.__lock[message.guild.id]:
-            self.__success_messages_to_delete[message.guild.id].add(message)
+        if not await self.is_enabled(guild_id):
+            return
 
-    async def __copy_success_messages_to_delete(self, guild_id: int) -> set[discord.Message]:
-        async with self.__lock[guild_id]:
-            now = get_now_utc()
-            r = {m for m in self.__success_messages_to_delete[guild_id] if m.created_at + timedelta(seconds=30) < now}
-            remaining = self.__success_messages_to_delete[guild_id] - r
-            self.__success_messages_to_delete[guild_id] = remaining
-            return r
-
-    async def delete_successful_messages(self) -> None:
-        await self.__ready.wait()
-        for guild_id in self.__success_messages_to_delete:
-            if self.bot.get_guild(guild_id) is None:
-                self.__success_messages_to_delete.pop(guild_id, None)
-                continue
-            channel = self.bot.get_channel(self._channel_cache[guild_id])
-            if channel is None:
+        async with self._lock[guild_id]:
+            if player.current is not None or not player.queue.empty():
                 return
-            messages = list(await self.__copy_success_messages_to_delete(guild_id))
-            for chunk in [messages[i : i + 100] for i in range(0, len(messages), 100)]:
-                await channel.delete_messages(
-                    chunk, reason=_("PyLavController: Deleting successful messages is channel")
-                )
+            LOGGER.debug("Guild %s: skip emptied the player, reloading radio", guild_id)
+            await self._top_up(player, event.track, start_playback=True)
 
-    async def add_success_reaction(self, message: discord.Message) -> None:
-        await self.__add_successful_message_to_delete(message)
-        with contextlib.suppress(discord.HTTPException):
-            await message.add_reaction("\N{WHITE HEAVY CHECK MARK}")
+    @commands.Cog.listener()
+    async def on_pylav_track_end_event(self, event: TrackEndEvent) -> None:
+        """Fallback for when a track finishes and nothing is left to play."""
+        player: Player = event.player
+        if player is None or player.guild is None:
+            return
+        guild_id = player.guild.id
+
+        if event.reason not in NATURAL_END_REASONS:
+            LOGGER.debug("Track ended in guild %s with reason %s - ignoring", guild_id, event.reason)
+            return
+        if not await self.is_enabled(guild_id):
+            return
+
+        async with self._lock[guild_id]:
+            # PyLav has already run next() by the time this fires. If
+            # something is playing or queued, we should stay out of the way.
+            if player.current is not None or not player.queue.empty():
+                return
+            LOGGER.debug("Guild %s: queue ran dry, reloading radio", guild_id)
+            await self._top_up(player, event.track, start_playback=True)
+
+    # ------------------------------------------------------------------
+    # Commands
+    # ------------------------------------------------------------------
+
+    @commands.group(name="ytradio")
+    @commands.guild_only()
+    async def command_ytradio(self, context: PyLavContext) -> None:
+        """Control YouTube radio autoplay."""
+
+    @command_ytradio.command(name="toggle")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def command_ytradio_toggle(self, context: PyLavContext, toggle: bool) -> None:
+        """Turn YouTube radio on or off for this server."""
+        if isinstance(context, discord.Interaction):
+            context = await self.bot.get_context(context)
+        if context.interaction and not context.interaction.response.is_done():
+            await context.defer(ephemeral=True)
+
+        await self._config.guild(context.guild).enabled.set(toggle)
+        self._enabled_cache[context.guild.id] = toggle
+
+        if toggle:
+            message = _(
+                "When the queue runs out I will keep playing tracks recommended by YouTube "
+                "based on whatever played last."
+            )
+        else:
+            message = _("I will stop playing recommended tracks when the queue runs out.")
+
+        await context.send(
+            embed=await self.pylav.construct_embed(description=message, messageable=context),
+            ephemeral=True,
+        )
+
+    @command_ytradio.command(name="buffer")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def command_ytradio_buffer(self, context: PyLavContext, size: int) -> None:
+        """Set how many recommended tracks to queue at a time (1-10)."""
+        if isinstance(context, discord.Interaction):
+            context = await self.bot.get_context(context)
+        if context.interaction and not context.interaction.response.is_done():
+            await context.defer(ephemeral=True)
+
+        if not 1 <= size <= 10:
+            await context.send(
+                embed=await self.pylav.construct_embed(
+                    description=_("Pick a number between 1 and 10."), messageable=context
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await self._config.guild(context.guild).buffer.set(size)
+        self._buffer_cache[context.guild.id] = size
+        await context.send(
+            embed=await self.pylav.construct_embed(
+                description=_("I will queue {number} recommended tracks at a time.").format(number=size),
+                messageable=context,
+            ),
+            ephemeral=True,
+        )
+
+    @command_ytradio.command(name="diagnose", aliases=["test"])
+    @commands.admin_or_permissions(manage_guild=True)
+    async def command_ytradio_diagnose(self, context: PyLavContext) -> None:
+        """Walk the radio pipeline against the current track and report each step."""
+        if isinstance(context, discord.Interaction):
+            context = await self.bot.get_context(context)
+        if context.interaction and not context.interaction.response.is_done():
+            await context.defer(ephemeral=True)
+
+        lines: list[str] = []
+        guild_id = context.guild.id
+
+        enabled = await self.is_enabled(guild_id)
+        lines.append(f"{'PASS' if enabled else 'FAIL'} - radio enabled: {enabled}")
+
+        player: Player | None = self.pylav.get_player(guild_id)
+        if player is None:
+            lines.append("FAIL - no player. Play something first, then run this.")
+            await self._send_diagnosis(context, lines)
+            return
+        lines.append("PASS - player exists")
+
+        builtin = False
+        with contextlib.suppress(Exception):
+            builtin = await player.autoplay_enabled()
+        if builtin:
+            lines.append("FAIL - PyLav autoplay is ON and will pre-empt the radio.")
+            lines.append("       Run: [p]playerset server auto false")
+        else:
+            lines.append("PASS - PyLav built-in autoplay is off")
+
+        with contextlib.suppress(Exception):
+            dc = await player.config.fetch_empty_queue_dc()
+            if getattr(dc, "enabled", False):
+                lines.append("WARN - empty-queue disconnect is on; bot may leave before the radio loads.")
+
+        seed = player.current or player.last_track
+        if seed is None:
+            lines.append("FAIL - nothing playing and no last track to seed from.")
+            await self._send_diagnosis(context, lines)
+            return
+
+        with contextlib.suppress(Exception):
+            lines.append(f"PASS - seed track: {await seed.title()}")
+
+        with contextlib.suppress(Exception):
+            if await seed.stream():
+                lines.append("WARN - seed is a livestream. Streams never end, so the")
+                lines.append("       radio hook will never fire while one is playing.")
+
+        video_id = await self._youtube_id_for(seed)
+        if not video_id:
+            lines.append("FAIL - could not resolve a YouTube video ID for the seed.")
+            await self._send_diagnosis(context, lines)
+            return
+        lines.append(f"PASS - resolved video ID: {video_id}")
+
+        tracks = await self._fetch_mix(video_id, player)
+        if not tracks:
+            lines.append(f"FAIL - mix RD{video_id} returned no tracks.")
+            lines.append("       Your Lavalink node's YouTube source may be broken,")
+            lines.append("       or this video has no mix available.")
+            await self._send_diagnosis(context, lines)
+            return
+        lines.append(f"PASS - mix returned {len(tracks)} tracks")
+
+        already = len(self._played[guild_id])
+        lines.append(f"INFO - {already} tracks in this guild's radio memory")
+        lines.append("")
+        lines.append("Pipeline works. If playback still stops, the listener isn't")
+        lines.append("firing - check that track end reason is FINISHED, not STOPPED.")
+
+        await self._send_diagnosis(context, lines)
+
+    async def _send_diagnosis(self, context: PyLavContext, lines: list[str]) -> None:
+        body = "\n".join(lines)
+        await context.send(
+            embed=await self.pylav.construct_embed(
+                title=_("YouTube radio diagnostics"),
+                description=f"```\n{body}\n```",
+                messageable=context,
+            ),
+            ephemeral=True,
+        )
+
+    @command_ytradio.command(name="reset")
+    @commands.admin_or_permissions(manage_guild=True)
+    async def command_ytradio_reset(self, context: PyLavContext) -> None:
+        """Forget which tracks the radio has already played here."""
+        if isinstance(context, discord.Interaction):
+            context = await self.bot.get_context(context)
+        if context.interaction and not context.interaction.response.is_done():
+            await context.defer(ephemeral=True)
+
+        self._played.pop(context.guild.id, None)
+        self._seeds.pop(context.guild.id, None)
+        await context.send(
+            embed=await self.pylav.construct_embed(
+                description=_("Radio history cleared."), messageable=context
+            ),
+            ephemeral=True,
+        )
