@@ -106,6 +106,28 @@ class DashboardIntegration:
 
         action = field("action") if kwargs.get("method") == "POST" else None
 
+        # Permission + billing gates must run before ANY action branch below,
+        # including the search/favourites/play early returns - otherwise those
+        # actions bypass both checks entirely.
+        if action:
+            _is_staff = await self._dash_is_staff(user, member, guild)
+            if action not in self.LISTENER_ACTIONS and not _is_staff:
+                return {
+                    "status": 0,
+                    "notifications": [
+                        {
+                            "message": "Only moderators can do that. You can still play, pause, skip and queue music.",
+                            "category": "warning",
+                        }
+                    ],
+                }
+            _ok, _charge_msg = await self._dash_charge(member, guild, action, _is_staff)
+            if not _ok:
+                return {
+                    "status": 0,
+                    "notifications": [{"message": _charge_msg, "category": "warning"}],
+                }
+
         # --- search: doesn't need an existing player ---
         if action == "search":
             search_term = (field("query") or "").strip()
@@ -126,6 +148,10 @@ class DashboardIntegration:
                     "search_term": search_term,
                     "favourites": await self._dash_fav_list(guild),
                     "is_staff": await self._dash_is_staff(user, member, guild),
+                    "economy": await self._dash_economy_state(
+                        member, guild, await self._dash_is_staff(user, member, guild)
+                    ),
+                    "wallet": await self._dash_wallet(member, guild),
                     "csrf_token_value": (kwargs.get("csrf_token") or ("", ""))[1],
                 },
             }
@@ -155,27 +181,6 @@ class DashboardIntegration:
                 "notifications": [{"message": message, "category": category}],
                 "redirect_url": kwargs.get("request_url"),
             }
-
-        if action and action not in self.LISTENER_ACTIONS:
-            if not await self._dash_is_staff(user, member, guild):
-                return {
-                    "status": 0,
-                    "notifications": [
-                        {
-                            "message": "Only moderators can do that. You can still play, pause, skip and queue music.",
-                            "category": "warning",
-                        }
-                    ],
-                }
-
-        if action:
-            _is_staff = await self._dash_is_staff(user, member, guild)
-            _ok, _charge_msg = await self._dash_charge(member, guild, action, _is_staff)
-            if not _ok:
-                return {
-                    "status": 0,
-                    "notifications": [{"message": _charge_msg, "category": "warning"}],
-                }
 
         if action:
             if player is None:
@@ -256,6 +261,10 @@ class DashboardIntegration:
                 "search_term": "",
                 "favourites": await self._dash_fav_list(guild),
                 "is_staff": await self._dash_is_staff(user, member, guild),
+                "economy": await self._dash_economy_state(
+                    member, guild, await self._dash_is_staff(user, member, guild)
+                ),
+                "wallet": await self._dash_wallet(member, guild),
             },
         }
 
@@ -449,11 +458,33 @@ class DashboardIntegration:
     # `dashboard_action_costs`; an action missing from that mapping is free.
     # Staff are never charged.
 
+    async def _dash_economy_state(self, member: discord.Member, guild: discord.Guild, is_staff: bool):
+        """Costs + balance for rendering the price list on the page."""
+        try:
+            enabled = await self._config.guild(guild).dashboard_economy_enabled()
+            costs = await self._config.guild(guild).dashboard_action_costs() or {}
+        except Exception:  # noqa: BLE001
+            return None
+        if not enabled or is_staff or not costs:
+            return None
+        try:
+            balance = await bank.get_balance(member)
+            currency = await bank.get_currency_name(guild)
+        except Exception:  # noqa: BLE001
+            return None
+        return {
+            "balance": balance,
+            "currency": currency,
+            "costs": dict(sorted(costs.items(), key=lambda kv: -int(kv[1] or 0))),
+        }
+
     async def _dash_charge(self, member: discord.Member, guild: discord.Guild, action: str, is_staff: bool):
         """Returns (ok, message). Charges the member if a cost is configured."""
         if is_staff:
             return True, None
         try:
+            if not await self._config.guild(guild).dashboard_economy_enabled():
+                return True, None
             costs = await self._config.guild(guild).dashboard_action_costs()
         except Exception:  # noqa: BLE001
             return True, None
@@ -474,6 +505,25 @@ class DashboardIntegration:
             log.exception("Economy charge failed for %r", action)
             # Never block playback because the economy backend misbehaved.
             return True, None
+
+
+    async def _dash_wallet(self, member: discord.Member, guild: discord.Guild) -> dict:
+        """Balance + configured costs, for display on the player page."""
+        try:
+            costs = await self._config.guild(guild).dashboard_action_costs() or {}
+        except Exception:  # noqa: BLE001
+            costs = {}
+        if not costs:
+            return {"enabled": False}
+        try:
+            return {
+                "enabled": True,
+                "balance": await bank.get_balance(member),
+                "currency": await bank.get_currency_name(guild),
+                "costs": dict(sorted(costs.items())),
+            }
+        except Exception:  # noqa: BLE001
+            return {"enabled": False}
 
     # ---------- guild favourites ----------
 
@@ -633,6 +683,26 @@ PLAYER_TEMPLATE = """
   .plc-q tr:last-child td { border-bottom:none; }
   .plc-thumb { width:42px; height:42px; border-radius:7px; object-fit:cover; }
   .plc-empty { opacity:.6; padding:22px; text-align:center; }
+  .plc-wallet {
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap;
+    padding:12px 16px; border-radius:14px;
+    background:linear-gradient(90deg, rgba(90,169,255,.14), rgba(90,169,255,.04));
+    border:1px solid rgba(130,175,255,.22);
+  }
+  .plc-wallet-bal { display:flex; align-items:center; gap:9px; font-size:1rem; white-space:nowrap; }
+  .plc-wallet-bal i { color:#5aa9ff; }
+  .plc-wallet-bal b { font-size:1.15rem; }
+  .plc-wallet-costs { display:flex; gap:6px; flex-wrap:wrap; margin-left:auto; }
+  .plc-price {
+    font-size:.7rem; padding:3px 9px; border-radius:999px; opacity:.85;
+    background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.10);
+  }
+  .plc-price b { color:#8ec5ff; }
+  .plc-tag {
+    display:inline-block; margin-left:6px; padding:1px 6px; border-radius:999px;
+    font-size:.66rem; font-weight:800; line-height:1.5;
+    background:rgba(90,169,255,.25); border:1px solid rgba(130,175,255,.4);
+  }
   .plc-sec-title { font-size:.72rem; text-transform:uppercase; letter-spacing:.06em;
                    font-weight:800; opacity:.55; margin:0 0 10px; }
 </style>
@@ -676,6 +746,20 @@ PLAYER_TEMPLATE = """
     </div>
   </div>
 
+  {% if economy %}
+    <div class="plc-wallet">
+      <div class="plc-wallet-bal">
+        <i class="fa fa-diamond"></i>
+        <span><b>{{ "{:,}".format(economy.balance) }}</b> {{ economy.currency }}</span>
+      </div>
+      <div class="plc-wallet-costs">
+        {% for name, price in economy.costs.items() %}
+          <span class="plc-price" title="{{ name }}">{{ name|replace("_", " ")|title }} <b>{{ price }}</b></span>
+        {% endfor %}
+      </div>
+    </div>
+  {% endif %}
+
   {% if player_state.current and not player_state.current.stream and player_state.current.duration_ms %}
     <form method="POST" class="plc-seek">
       <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
@@ -686,7 +770,7 @@ PLAYER_TEMPLATE = """
              oninput="document.getElementById('plcSeekOut').textContent = this.value;" />
       <span class="plc-time">{{ player_state.current.duration }}</span>
       <button class="plc-btn" name="action" value="seek" title="Seek to position">
-        <i class="fa fa-location-arrow"></i> Seek
+        <i class="fa fa-location-arrow"></i> Seek{% if economy and economy.costs.get("seek") %}<span class="plc-tag">{{ economy.costs["seek"] }}</span>{% endif %}
       </button>
       <span class="plc-time" id="plcSeekOut" style="opacity:.45;"></span>
     </form>
@@ -694,16 +778,16 @@ PLAYER_TEMPLATE = """
 
   <form method="POST" class="plc-controls">
     <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
-    <button class="plc-btn round" name="action" value="previous" title="Previous"><i class="fa fa-step-backward"></i></button>
+    <button class="plc-btn round" name="action" value="previous" title="Previous"><i class="fa fa-step-backward"></i>{% if economy and economy.costs.get("previous") %}<span class="plc-tag">{{ economy.costs["previous"] }}</span>{% endif %}</button>
     {% if player_state.paused %}
       <button class="plc-btn play" name="action" value="resume" title="Resume"><i class="fa fa-play"></i></button>
     {% else %}
       <button class="plc-btn play" name="action" value="pause" title="Pause"><i class="fa fa-pause"></i></button>
     {% endif %}
-    <button class="plc-btn round" name="action" value="skip" title="Skip"><i class="fa fa-step-forward"></i></button>
-    <button class="plc-btn" name="action" value="shuffle" title="Shuffle the queue"><i class="fa fa-random"></i> Shuffle</button>
+    <button class="plc-btn round" name="action" value="skip" title="Skip"><i class="fa fa-step-forward"></i>{% if economy and economy.costs.get("skip") %}<span class="plc-tag">{{ economy.costs["skip"] }}</span>{% endif %}</button>
+    <button class="plc-btn" name="action" value="shuffle" title="Shuffle the queue"><i class="fa fa-random"></i> Shuffle{% if economy and economy.costs.get("shuffle") %}<span class="plc-tag">{{ economy.costs["shuffle"] }}</span>{% endif %}</button>
     {% if player_state.current %}
-      <button class="plc-btn" name="action" value="fav_add" title="Save this track to the guild favourites"><i class="fa fa-star"></i> Favourite</button>
+      <button class="plc-btn" name="action" value="fav_add" title="Save this track to the guild favourites"><i class="fa fa-star"></i> Favourite{% if economy and economy.costs.get("fav_add") %}<span class="plc-tag">{{ economy.costs["fav_add"] }}</span>{% endif %}</button>
     {% endif %}
     <button class="plc-btn" name="action" value="repeat_track" title="Repeat current track"><i class="fa fa-repeat"></i> Track</button>
     <button class="plc-btn" name="action" value="repeat_queue" title="Repeat the queue"><i class="fa fa-refresh"></i> Queue</button>
@@ -764,7 +848,7 @@ PLAYER_TEMPLATE = """
         <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
         <input class="plc-input" type="text" name="query" placeholder="Song, artist, or a link..."
                value="{{ search_term or '' }}" />
-        <button class="plc-btn" name="action" value="search"><i class="fa fa-search"></i> Search</button>
+        <button class="plc-btn" name="action" value="search"><i class="fa fa-search"></i> Search{% if economy and economy.costs.get("search") %}<span class="plc-tag">{{ economy.costs["search"] }}</span>{% endif %}</button>
       </form>
 
       {% if search_results %}
@@ -858,6 +942,21 @@ PLAYER_TEMPLATE = """
       <p class="plc-empty">No favourites yet. Hit <b>Favourite</b> while a track is playing.</p>
     {% endif %}
   </div>
+
+  {% if wallet and wallet.enabled %}
+    <div class="plc-panel">
+      <h5><i class="fa fa-money me-1"></i> Your balance</h5>
+      <p class="plc-hint">
+        <b style="font-size:1.05rem; color:#fff;">{{ "{:,}".format(wallet.balance) }} {{ wallet.currency }}</b>
+        {% if not is_staff %}&mdash; some actions cost credits on this server.{% else %}&mdash; staff are not charged.{% endif %}
+      </p>
+      <div class="d-flex flex-wrap gap-2">
+        {% for name, cost in wallet.costs.items() %}
+          <span class="plc-badge">{{ name|replace("_", " ") }}: {{ cost }}</span>
+        {% endfor %}
+      </div>
+    </div>
+  {% endif %}
 
   {% if not is_staff %}
     <p class="plc-hint" style="text-align:center;">
