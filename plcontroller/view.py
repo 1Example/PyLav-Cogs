@@ -724,42 +724,36 @@ class PersistentControllerView(discord.ui.View):
         # Row 0 - playback controls
         self.previous_track_button = PreviousTrackButton(
             style=TRANSPARENT,
-            label=_("Back"),
             row=0,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:previous_track_button:9",
         )
         self.paused_button = PauseTrackButton(
             style=TRANSPARENT,
-            label=_("Pause"),
             row=0,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:paused_button:7",
         )
         self.resume_button = ResumeTrackButton(
             style=TRANSPARENT,
-            label=_("Resume"),
             row=0,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:resume_button:8",
         )
         self.skip_button = SkipTrackButton(
             style=TRANSPARENT,
-            label=_("Skip"),
             row=0,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:skip_button:10",
         )
         self.shuffle_button = ShuffleButton(
             style=TRANSPARENT,
-            label=_("Shuffle"),
             row=0,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:shuffle_button:11",
         )
         self.stop_button = StopTrackButton(
             style=TRANSPARENT,
-            label=_("Stop"),
             row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:stop_button:12",
@@ -768,49 +762,42 @@ class PersistentControllerView(discord.ui.View):
         # Row 1 - volume, repeat and queue
         self.decrease_volume_button = DecreaseVolumeButton(
             style=TRANSPARENT,
-            label=_("Vol -"),
             row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:decrease_volume_button:5",
         )
         self.increase_volume_button = IncreaseVolumeButton(
             style=TRANSPARENT,
-            label=_("Vol +"),
             row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:increase_volume_button:6",
         )
         self.repeat_queue_button_on = ToggleRepeatQueueButton(
             style=TRANSPARENT,
-            label=_("Loop queue"),
             row=2,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:repeat_queue_button_on:1",
         )
         self.repeat_button_on = ToggleRepeatButton(
             style=TRANSPARENT,
-            label=_("Loop"),
             row=2,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:repeat_button_on:2",
         )
         self.repeat_button_off = ToggleRepeatButton(
             style=TRANSPARENT,
-            label=_("Loop off"),
             row=2,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:repeat_button_off:3",
         )
         self.queue_button = QueueButton(
             style=TRANSPARENT,
-            label=_("Queue"),
             row=3,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:queue_button:14",
         )
         self.show_history_button = QueueHistoryButton(
             style=TRANSPARENT,
-            label=_("History"),
             row=3,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:show_history_button:4",
@@ -819,7 +806,6 @@ class PersistentControllerView(discord.ui.View):
         # Row 2 - utility
         self.refresh_button = RefreshButton(
             style=TRANSPARENT,
-            label=_("Refresh"),
             row=3,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:refresh_button:13",
@@ -1072,14 +1058,38 @@ class PersistentControllerView(discord.ui.View):
                 kwargs["attachments"] = attachments
             await self.message.edit(view=self, **kwargs)
 
+    # Buttons every listener may press. Mirrors LISTENER_ACTIONS on the web
+    # dashboard so both surfaces enforce the same rules.
+    LISTENER_BUTTONS = (
+        "previous_track_button",
+        "paused_button",
+        "resume_button",
+        "skip_button",
+        "shuffle_button",
+        "decrease_volume_button",
+        "increase_volume_button",
+        "queue_button",
+        "show_history_button",
+        "refresh_button",
+    )
+
     async def interaction_check(self, interaction: DISCORD_INTERACTION_TYPE, /) -> bool:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True)
 
-        if not await is_dj_logic(interaction):
+        # custom_id format: "pylav__pylavcontroller_persistent_view:<name>:<n>"
+        custom_id = (interaction.data or {}).get("custom_id", "")
+        parts = custom_id.split(":")
+        button_name = parts[1] if len(parts) > 2 else ""
+        listener_allowed = button_name in self.LISTENER_BUTTONS
+
+        if not listener_allowed and not await is_dj_logic(interaction):
             await interaction.send(
                 embed=await interaction.client.pylav.construct_embed(
-                    description=_("You need to be a disc jockey to interact with the controller in this server."),
+                    description=_(
+                        "Only a disc jockey can do that. You can still play, pause, skip, "
+                        "shuffle and adjust the volume."
+                    ),
                     messageable=interaction,
                 ),
                 delete_after=PUBLIC_DELETE_AFTER,
