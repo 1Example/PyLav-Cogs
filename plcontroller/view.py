@@ -133,7 +133,7 @@ class IncreaseVolumeButton(discord.ui.Button):
     ):
         super().__init__(
             style=style,
-            emoji=emojis.VOLUME_UP,
+            emoji="🔊",
             label=label,
             row=row,
             custom_id=custom_id,
@@ -159,7 +159,7 @@ class DecreaseVolumeButton(discord.ui.Button):
     ):
         super().__init__(
             style=style,
-            emoji=emojis.VOLUME_DOWN,
+            emoji="🔉",
             label=label,
             row=row,
             custom_id=custom_id,
@@ -185,7 +185,7 @@ class StopTrackButton(discord.ui.Button):
     ):
         super().__init__(
             style=style,
-            emoji=emojis.STOP,
+            emoji="⏹️",
             label=label,
             row=row,
             custom_id=custom_id,
@@ -211,7 +211,7 @@ class PauseTrackButton(discord.ui.Button):
     ):
         super().__init__(
             style=style,
-            emoji=emojis.PAUSE,
+            emoji="⏸️",
             label=label,
             row=row,
             custom_id=custom_id,
@@ -237,7 +237,7 @@ class ResumeTrackButton(discord.ui.Button):
     ):
         super().__init__(
             style=style,
-            emoji=emojis.PLAY,
+            emoji="▶️",
             label=label,
             row=row,
             custom_id=custom_id,
@@ -263,7 +263,7 @@ class SkipTrackButton(discord.ui.Button):
     ):
         super().__init__(
             style=style,
-            emoji=emojis.NEXT,
+            emoji="⏭️",
             label=label,
             row=row,
             custom_id=custom_id,
@@ -289,7 +289,7 @@ class ToggleRepeatButton(discord.ui.Button):
     ):
         super().__init__(
             style=style,
-            emoji=emojis.LOOP,
+            emoji="🔁",
             label=label,
             row=row,
             custom_id=custom_id,
@@ -323,7 +323,7 @@ class QueueHistoryButton(discord.ui.Button):
     ):
         super().__init__(
             style=style,
-            emoji=emojis.PLAYLIST,
+            emoji="🕓",
             label=label,
             row=row,
             custom_id=custom_id,
@@ -332,217 +332,53 @@ class QueueHistoryButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer()
-        context = await self.cog.bot.get_context(interaction)
-        if not (__ := context.player):
-            return await context.send(
+            await interaction.response.defer(ephemeral=True)
+        player = self.cog.pylav.get_player(interaction.guild.id)
+        if player is None:
+            return await interaction.followup.send(
                 embed=await self.cog.pylav.construct_embed(
-                    description=_("I am not connected to any voice channel at the moment."), messageable=interaction
+                    description=_("I am not connected to any voice channel at the moment."),
+                    messageable=interaction,
                 ),
-                delete_after=PUBLIC_DELETE_AFTER,
-            )
-        from pylav.extension.red.ui.sources.queue import QueueSource
-
-        command_cog = resolve_command_cog(self.cog)
-        menu_cls = get_controller_queue_menu()
-
-        await menu_cls(
-            cog=command_cog,
-            bot=self.cog.bot,
-            source=QueueSource(guild_id=interaction.guild.id, cog=command_cog, history=True),
-            original_author=interaction.user,
-            history=True,
-        ).start(ctx=context)
-
-
-async def delete_response_later(interaction, delay: float) -> None:
-    """Delete an interaction's original response after ``delay`` seconds."""
-    await asyncio.sleep(delay)
-    with contextlib.suppress(Exception):
-        await interaction.delete_original_response()
-
-
-_CONTROLLER_QUEUE_MENU = None
-
-
-def resolve_command_cog(cog):
-    """Return the cog that actually owns the player commands.
-
-    PyLav's queue menu buttons call things like ``cog.command_skip`` and
-    ``cog.command_volume_change_by``. Those live on the PyLavPlayer (audio)
-    cog, not on PyLavController, so handing the menu ``self`` makes every
-    one of those buttons raise AttributeError. Hand it the audio cog
-    instead, falling back to the controller if audio isn't loaded.
-    """
-    return cog.bot.get_cog("PyLavPlayer") or cog
-
-
-def get_controller_queue_menu():
-    """Build (once) a QueueMenu restyled to match the controller panel.
-
-    Imported lazily because pylav's menu module pulls in the sources and
-    buttons packages, and importing those at module scope risks a circular
-    import during cog load.
-    """
-    global _CONTROLLER_QUEUE_MENU
-    if _CONTROLLER_QUEUE_MENU is not None:
-        return _CONTROLLER_QUEUE_MENU
-
-    from pylav.extension.red.ui.menus.queue import QueueMenu
-
-    class ControllerQueueMenu(QueueMenu):
-        """QueueMenu with the controller's transparent styling and grouping."""
-
-        def __init__(self, *args, **kwargs):
-            kwargs.setdefault("timeout", QUEUE_MENU_TIMEOUT)
-            kwargs.setdefault("delete_after_timeout", True)
-            super().__init__(*args, **kwargs)
-
-            # Every button transparent, same as the controller panel.
-            for attribute in vars(self).values():
-                if isinstance(attribute, discord.ui.Button):
-                    attribute.style = TRANSPARENT
-
-            # Regroup to mirror the controller: playback first, then
-            # volume/repeat, then navigation, then queue management.
-            # prepare() places items by each button's row attribute, so
-            # reordering here needs no changes to prepare() itself.
-            for button, row in (
-                (self.previous_track_button, 0),
-                (self.paused_button, 0),
-                (self.resume_button, 0),
-                (self.skip_button, 0),
-                (self.shuffle_button, 0),
-                (self.stop_button, 0),
-                (self.decrease_volume_button, 1),
-                (self.increase_volume_button, 1),
-                (self.repeat_button_on, 1),
-                (self.repeat_button_off, 1),
-                (self.repeat_queue_button_on, 1),
-                (self.show_history_button, 1),
-                (self.refresh_button, 1),
-                (self.first_button, 2),
-                (self.backward_button, 2),
-                (self.forward_button, 2),
-                (self.last_button, 2),
-                (self.close_button, 2),
-                (self.enqueue_button, 3),
-                (self.remove_from_queue_button, 3),
-                (self.play_now_button, 3),
-                (self.clear_queue_button, 3),
-                (self.queue_disconnect, 3),
-            ):
-                button.row = row
-
-            for attribute in vars(self).values():
-                if isinstance(attribute, discord.ui.Button):
-                    self._wrap_for_auto_delete(attribute)
-
-            # The navigation buttons are already ButtonStyle.grey -- what makes
-            # them look blue is the emoji. Unicode glyphs render as coloured
-            # Twemoji regardless of button style, so swap them for plain text
-            # labels (and the refresh glyph for PyLav's monochrome custom one)
-            # to match the rest of the panel.
-            for button, label in (
-                (self.first_button, "\u00ab"),
-                (self.backward_button, "\u2039"),
-                (self.forward_button, "\u203a"),
-                (self.last_button, "\u00bb"),
-            ):
-                button.emoji = None
-                button.label = label
-            with contextlib.suppress(Exception):
-                self.refresh_button.emoji = emojis.UPDATE
-
-        async def send_initial_message(self, ctx):
-            """Send the menu publicly rather than ephemerally.
-
-            PyLav hardcodes ``ephemeral=True`` here. That has two costs: only
-            the person who clicked can see it, and on_timeout skips its own
-            ``message.delete()`` for ephemeral messages -- so the menu never
-            cleaned itself up either.
-            """
-            self.ctx = ctx
-            kwargs = await self.get_page(self.current_page)
-            await self.prepare()
-            self.message = await ctx.send(**kwargs, view=self)
-            return self.message
-
-        @staticmethod
-        def _wrap_for_auto_delete(button: discord.ui.Button) -> None:
-            """Make a button's ephemeral confirmation delete itself shortly after."""
-            if type(button).__name__ not in CONFIRMING_BUTTONS:
-                return
-            original = button.callback
-            if getattr(original, "__plc_wrapped__", False):
-                return
-
-            async def wrapped(interaction, *, _original=original):
-                real_followup = interaction.followup
-                real_response = interaction.response
-                with contextlib.suppress(Exception):
-                    interaction._cs_followup = AutoDeletingFollowup(real_followup, PUBLIC_DELETE_AFTER)
-                with contextlib.suppress(Exception):
-                    interaction._cs_response = PublicInteractionResponse(real_response)
-                try:
-                    await _original(interaction)
-                finally:
-                    with contextlib.suppress(Exception):
-                        interaction._cs_followup = real_followup
-                    with contextlib.suppress(Exception):
-                        interaction._cs_response = real_response
-                    # If the reply landed on the deferred response rather than
-                    # a followup, clear that too.
-                    asyncio.create_task(delete_response_later(interaction, PUBLIC_DELETE_AFTER))
-
-            wrapped.__plc_wrapped__ = True
-            button.callback = wrapped
-
-        def _display_order(self) -> list:
-            """Left-to-right order within each row, mirroring the panel."""
-            return [
-                self.previous_track_button,
-                self.paused_button,
-                self.resume_button,
-                self.skip_button,
-                self.shuffle_button,
-                self.stop_button,
-                self.decrease_volume_button,
-                self.increase_volume_button,
-                self.repeat_button_on,
-                self.repeat_button_off,
-                self.repeat_queue_button_on,
-                self.show_history_button,
-                self.refresh_button,
-                self.first_button,
-                self.backward_button,
-                self.forward_button,
-                self.last_button,
-                self.close_button,
-                self.enqueue_button,
-                self.remove_from_queue_button,
-                self.play_now_button,
-                self.clear_queue_button,
-                self.queue_disconnect,
-            ]
-
-        async def prepare(self):
-            await super().prepare()
-            # prepare() adds buttons in its own order, and discord.py keeps
-            # insertion order within a row. Re-sort so the row contents read
-            # the same way round as the controller panel. The sort is stable
-            # and keyed on the same attribute discord.py renders by, so
-            # anything unrecognised keeps its relative position at the end.
-            priority = {id(button): index for index, button in enumerate(self._display_order())}
-            self._children.sort(
-                key=lambda child: (
-                    getattr(child, "_rendered_row", None) or 0,
-                    priority.get(id(child), len(priority)),
-                )
+                ephemeral=True,
             )
 
-    _CONTROLLER_QUEUE_MENU = ControllerQueueMenu
-    return _CONTROLLER_QUEUE_MENU
+        # List only - the transport controls live on the main controller, so this
+        # no longer opens PyLav's full queue menu with a duplicate button panel.
+        try:
+            history = list(player.history.raw_queue)
+        except Exception:  # noqa: BLE001
+            history = []
+        if not history:
+            return await interaction.followup.send(
+                embed=await self.cog.pylav.construct_embed(
+                    description=_("Nothing has been played yet."), messageable=interaction
+                ),
+                ephemeral=True,
+            )
+
+        lines = []
+        for position, track in enumerate(history[:25], start=1):
+            try:
+                title = await track.title()
+                author = await track.author()
+            except Exception:  # noqa: BLE001
+                title, author = _("Unknown title"), ""
+            lines.append(f"`{position:>2}.` **{title}**" + (f" — {author}" if author else ""))
+
+        description = "\n".join(lines)
+        if len(history) > 25:
+            description += "\n\n" + _("...and {number} more.").format(number=len(history) - 25)
+
+        await interaction.followup.send(
+            embed=await self.cog.pylav.construct_embed(
+                title=_("Recently played in {guild}").format(guild=interaction.guild.name),
+                description=description,
+                footer=_("{tracks} track(s)").format(tracks=len(history)),
+                messageable=interaction,
+            ),
+            ephemeral=True,
+        )
 
 
 class QueueButton(discord.ui.Button):
@@ -556,7 +392,7 @@ class QueueButton(discord.ui.Button):
     ):
         super().__init__(
             style=style,
-            emoji=emojis.QUEUE,
+            emoji="📜",
             label=label,
             row=row,
             custom_id=custom_id,
@@ -624,7 +460,7 @@ class ToggleRepeatQueueButton(discord.ui.Button):
     ):
         super().__init__(
             style=style,
-            emoji=emojis.REPEAT,
+            emoji="🔂",
             label=label,
             row=row,
             custom_id=custom_id,
@@ -659,7 +495,7 @@ class ShuffleButton(discord.ui.Button):
     ):
         super().__init__(
             style=style,
-            emoji=emojis.RANDOM,
+            emoji="🔀",
             label=label,
             row=row,
             custom_id=custom_id,
@@ -685,7 +521,7 @@ class PreviousTrackButton(discord.ui.Button):
     ):
         super().__init__(
             style=style,
-            emoji=emojis.PREVIOUS,
+            emoji="⏮️",
             label=label,
             row=row,
             custom_id=custom_id,
@@ -711,7 +547,7 @@ class RefreshButton(discord.ui.Button):
     ):
         super().__init__(
             style=style,
-            emoji=emojis.UPDATE,
+            emoji="🔄",
             label=label,
             row=row,
             custom_id=custom_id,
@@ -740,7 +576,7 @@ class ControllerDisconnectButton(discord.ui.Button):
         custom_id: str | None = None,
         label: str | None = None,
     ):
-        super().__init__(style=style, emoji=emojis.POWER, label=label, row=row, custom_id=custom_id)
+        super().__init__(style=style, emoji="\u23cf\ufe0f", label=label, row=row, custom_id=custom_id)
         self.cog = cog
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
@@ -764,7 +600,7 @@ class ControllerClearQueueButton(discord.ui.Button):
         custom_id: str | None = None,
         label: str | None = None,
     ):
-        super().__init__(style=style, emoji=emojis.TRASH, label=label, row=row, custom_id=custom_id)
+        super().__init__(style=style, emoji="\U0001f5d1\ufe0f", label=label, row=row, custom_id=custom_id)
         self.cog = cog
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
@@ -1212,7 +1048,29 @@ class PersistentControllerView(discord.ui.View):
         repeat = _("Track") if repeat_current else (_("Queue") if repeat_queue else _("Off"))
         embed.add_field(name=_("Repeat"), value=repeat, inline=True)
 
+        # Autoplay / effects / total queue time round out the summary.
+        try:
+            autoplay = await player.autoplay_enabled()
+        except Exception:  # noqa: BLE001
+            autoplay = False
+        embed.add_field(
+            name=_("Autoplay"), value=_("On") if autoplay else _("Off"), inline=True
+        )
+
         raw = list(player.queue.raw_queue)
+        remaining = 0
+        for entry in raw:
+            try:
+                remaining += await entry.duration() or 0
+            except Exception:  # noqa: BLE001
+                continue
+        embed.add_field(
+            name=_("Queue length"),
+            value=_("{count} track(s) · {time}").format(count=len(raw), time=self._fmt(remaining)),
+            inline=True,
+        )
+        embed.add_field(name="\u200b", value="\u200b", inline=True)
+
         if raw:
             upcoming = []
             for nxt in raw[:3]:
@@ -1227,6 +1085,18 @@ class PersistentControllerView(discord.ui.View):
             )
         else:
             embed.add_field(name=_("Up next"), value=_("Queue is empty"), inline=False)
+
+        try:
+            base_url = await self.cog._config.dashboard_url()
+        except Exception:  # noqa: BLE001
+            base_url = ""
+        if base_url:
+            embed.add_field(
+                name=_("Web player"),
+                value=f"[{_('Open the dashboard controller')}]"
+                f"({base_url}/dashboard/{self.guild.id}/third-party/PyLavController)",
+                inline=False,
+            )
 
         channel = getattr(player, "channel", None)
         if channel is not None:
