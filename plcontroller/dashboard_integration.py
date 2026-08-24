@@ -254,8 +254,15 @@ class DashboardIntegration:
         for index, track in enumerate(raw_queue[:25], start=1):
             queue_items.append(await self._dash_track_dict(track, position=index))
 
+        try:
+            position_ms = await player.position()
+        except Exception:  # noqa: BLE001
+            position_ms = 0
+
         state: dict[str, t.Any] = {
             "connected": True,
+            "position_ms": int(position_ms or 0),
+            "position": _fmt_ms(position_ms),
             "paused": bool(player.paused),
             "playing": bool(player.is_playing),
             "volume": int(player.volume),
@@ -267,6 +274,10 @@ class DashboardIntegration:
 
         if current is not None:
             current_data = await self._dash_track_dict(current)
+            try:
+                current_data["duration_ms"] = int(await current.duration() or 0)
+            except Exception:  # noqa: BLE001
+                current_data["duration_ms"] = 0
             try:
                 current_data["artwork"] = await current.artworkUrl() or ""
             except Exception:  # noqa: BLE001
@@ -284,7 +295,12 @@ class DashboardIntegration:
     async def _dash_search(self, search_term: str, limit: int = 10):
         """Returns (results, error_message). Results are plain dicts for the template."""
         try:
-            query = await Query.from_string(search_term)
+            # A bare string can resolve to a single track; prefixing forces the
+            # node to return a search result set instead of one match.
+            looks_like_url = search_term.startswith(("http://", "https://", "spotify:"))
+            query = await Query.from_string(
+                search_term if looks_like_url else f"ytsearch:{search_term}"
+            )
             response = await self.pylav.search_query(query)
         except Exception as exc:  # noqa: BLE001
             log.exception("Dashboard search failed for %r", search_term)
@@ -386,260 +402,235 @@ class DashboardIntegration:
 
 PLAYER_TEMPLATE = """
 <style>
-  .plc-wrap { display: flex; flex-direction: column; gap: 16px; }
+  .plc { display:flex; flex-direction:column; gap:18px; }
+
+  /* ---------- now playing ---------- */
   .plc-now {
-    display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
-    padding: 16px; border-radius: 12px;
-    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
+    position:relative; overflow:hidden;
+    display:flex; gap:18px; align-items:center; flex-wrap:wrap;
+    padding:20px; border-radius:16px;
+    background:rgba(24,48,105,.22); border:1px solid rgba(130,175,255,.16);
   }
-  .plc-art {
-    height: 96px; width: 96px; border-radius: 10px; object-fit: cover;
-    background: rgba(255,255,255,0.06); flex: 0 0 auto;
+  .plc-now-bg {
+    position:absolute; inset:0; background-size:cover; background-position:center;
+    filter:blur(28px) saturate(140%); opacity:.35; transform:scale(1.15); z-index:0;
   }
-  .plc-meta { flex: 1 1 240px; min-width: 0; }
-  .plc-title {
-    font-size: 1.1rem; font-weight: 700; margin: 0 0 2px 0;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  .plc-now > * { position:relative; z-index:1; }
+  .plc-art { height:112px; width:112px; border-radius:12px; object-fit:cover;
+             box-shadow:0 10px 30px rgba(0,0,0,.55); flex:0 0 auto; }
+  .plc-art-ph { background:rgba(255,255,255,.06); }
+  .plc-meta { flex:1 1 260px; min-width:0; }
+  .plc-title { font-size:1.15rem; font-weight:800; margin:0 0 3px; overflow:hidden;
+               text-overflow:ellipsis; white-space:nowrap; }
+  .plc-author { opacity:.72; font-size:.9rem; margin:0; }
+  .plc-badges { margin-top:9px; display:flex; gap:6px; flex-wrap:wrap; }
+  .plc-badge { font-size:.7rem; padding:3px 9px; border-radius:999px; font-weight:700;
+               letter-spacing:.03em; text-transform:uppercase;
+               background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.12); }
+  .plc-badge.live { background:rgba(237,66,69,.25); border-color:rgba(237,66,69,.5); }
+
+  /* ---------- visualiser ---------- */
+  .plc-viz { display:flex; align-items:flex-end; gap:3px; height:44px; flex:0 0 auto; }
+  .plc-viz i {
+    display:block; width:4px; border-radius:2px; background:linear-gradient(to top,#3ba55d,#5aa9ff);
+    animation:plcBar 900ms ease-in-out infinite alternate;
   }
-  .plc-author { opacity: 0.7; font-size: 0.88rem; margin: 0; }
-  .plc-badges { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
-  .plc-badge {
-    font-size: 0.72rem; padding: 2px 8px; border-radius: 999px;
-    background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.1);
-  }
-  .plc-controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .plc-viz.paused i { animation-play-state:paused; opacity:.35; }
+  @keyframes plcBar { from { height:12%; } to { height:100%; } }
+
+  /* ---------- seek ---------- */
+  .plc-seek { display:flex; align-items:center; gap:12px; font-variant-numeric:tabular-nums; }
+  .plc-seek input[type=range] { flex:1 1 auto; }
+  .plc-time { font-size:.82rem; opacity:.75; min-width:44px; text-align:center; }
+
+  /* ---------- controls ---------- */
+  .plc-controls { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
   .plc-btn {
-    display: inline-flex; align-items: center; justify-content: center;
-    height: 42px; min-width: 42px; padding: 0 14px; gap: 6px;
-    border-radius: 10px; cursor: pointer; font-size: 0.9rem; font-weight: 600;
-    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12);
-    color: inherit; text-decoration: none;
+    display:inline-flex; align-items:center; justify-content:center; gap:7px;
+    height:44px; min-width:44px; padding:0 15px; border-radius:11px; cursor:pointer;
+    font-size:.88rem; font-weight:600; color:inherit; text-decoration:none;
+    background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.12);
+    transition:background .15s ease, border-color .15s ease, transform .08s ease;
   }
-  .plc-btn:hover { background: rgba(255,255,255,0.11); }
-  .plc-btn.primary { background: #2f6fed; border-color: #2f6fed; color: #fff; }
-  .plc-btn.danger  { border-color: rgba(255,90,90,0.5); color: #ff7b7b; }
-  .plc-vol { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .plc-vol input[type=range] { width: 180px; }
-  .plc-queue { width: 100%; border-collapse: collapse; }
-  .plc-queue th, .plc-queue td {
-    text-align: left; padding: 8px 10px; font-size: 0.86rem;
-    border-bottom: 1px solid rgba(255,255,255,0.06);
-  }
-  .plc-queue th { opacity: 0.6; font-size: 0.74rem; text-transform: uppercase; }
-  .plc-empty { opacity: 0.65; padding: 24px; text-align: center; }
-  .plc-panels { display: grid; gap: 16px; grid-template-columns: 1fr; margin-top: 4px; }
-  @media (min-width: 1100px) { .plc-panels { grid-template-columns: 3fr 2fr; } }
-  .plc-panel {
-    padding: 16px; border-radius: 12px;
-    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
-  }
-  .plc-panel h5 { margin: 0 0 4px 0; font-size: 1rem; }
-  .plc-hint { opacity: 0.6; font-size: 0.8rem; margin: 0 0 10px 0; }
-  .plc-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-  .plc-label { font-size: 0.78rem; opacity: 0.7; }
-  .plc-input {
-    flex: 1 1 240px; min-width: 0; height: 42px; padding: 0 12px;
-    border-radius: 10px; background: rgba(0,0,0,0.25);
-    border: 1px solid rgba(255,255,255,0.12); color: inherit; font-size: 0.9rem;
-  }
-  .plc-input:focus { outline: none; border-color: rgba(255,255,255,0.3); }
+  .plc-btn:hover { background:rgba(255,255,255,.12); }
+  .plc-btn:active { transform:translateY(1px); }
+  .plc-btn.round { border-radius:50%; padding:0; width:44px; }
+  .plc-btn.play { width:56px; height:56px; border-radius:50%; font-size:1.15rem;
+                  background:linear-gradient(135deg,#2f6fed,#5aa9ff); border-color:transparent; color:#fff; }
+  .plc-btn.danger { border-color:rgba(255,90,90,.45); color:#ff8b8b; }
+  .plc-btn.on { background:rgba(90,169,255,.22); border-color:rgba(90,169,255,.5); }
+
+  /* ---------- panels / queue ---------- */
+  .plc-panels { display:grid; gap:16px; grid-template-columns:1fr; }
+  @media (min-width:1100px){ .plc-panels { grid-template-columns:3fr 2fr; } }
+  .plc-panel { padding:16px; border-radius:14px;
+               background:rgba(90,130,220,.06); border:1px solid rgba(120,160,255,.12); }
+  .plc-panel h5 { margin:0 0 3px; font-size:.95rem; }
+  .plc-hint { opacity:.6; font-size:.78rem; margin:0 0 11px; }
+  .plc-row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .plc-input { flex:1 1 240px; min-width:0; height:44px; padding:0 13px; border-radius:11px;
+               background:rgba(0,0,0,.3); border:1px solid rgba(255,255,255,.12);
+               color:inherit; font-size:.9rem; }
+  .plc-input:focus { outline:none; border-color:rgba(130,175,255,.45); }
+  .plc-q { width:100%; border-collapse:collapse; }
+  .plc-q th, .plc-q td { text-align:left; padding:9px 10px; font-size:.86rem;
+                         border-bottom:1px solid rgba(255,255,255,.06); }
+  .plc-q th { opacity:.55; font-size:.7rem; text-transform:uppercase; letter-spacing:.05em; }
+  .plc-q tr:last-child td { border-bottom:none; }
+  .plc-thumb { width:42px; height:42px; border-radius:7px; object-fit:cover; }
+  .plc-empty { opacity:.6; padding:22px; text-align:center; }
+  .plc-sec-title { font-size:.72rem; text-transform:uppercase; letter-spacing:.06em;
+                   font-weight:800; opacity:.55; margin:0 0 10px; }
 </style>
 
 {% if not player_state.connected %}
   <div class="plc-empty">
-    <h4>Not connected</h4>
-    <p>Join a voice channel and play something below - I'll connect automatically.</p>
-  </div>
-
-  <div class="plc-panels">
-
-    <div class="plc-panel">
-      <h5>Search &amp; play</h5>
-      <p class="plc-hint">Search YouTube (and every other source your nodes support), then queue a result.</p>
-      <form method="POST" class="plc-row">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
-        <input class="plc-input" type="text" name="query" placeholder="Search for a song, artist, or paste a link..."
-               value="{{ search_term or '' }}" />
-        <button class="plc-btn primary" name="action" value="search">Search</button>
-      </form>
-
-      {% if search_results %}
-        <table class="plc-queue" style="margin-top:12px;">
-          <thead><tr><th></th><th>Title</th><th>Artist</th><th>Length</th><th></th></tr></thead>
-          <tbody>
-            {% for r in search_results %}
-              <tr>
-                <td style="width:52px;">
-                  {% if r.artwork %}<img src="{{ r.artwork }}" alt="" style="width:44px;height:44px;border-radius:6px;object-fit:cover;" />{% endif %}
-                </td>
-                <td>{% if r.uri %}<a href="{{ r.uri }}" target="_blank">{{ r.title }}</a>{% else %}{{ r.title }}{% endif %}</td>
-                <td>{{ r.author }}</td>
-                <td>{% if r.stream %}LIVE{% else %}{{ r.duration }}{% endif %}</td>
-                <td style="white-space:nowrap;">
-                  <form method="POST" style="display:inline;">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
-                    <input type="hidden" name="identifier" value="{{ r.identifier }}" />
-                    <button class="plc-btn" name="action" value="play" title="Add to queue">+ Queue</button>
-                  </form>
-                  <form method="POST" style="display:inline;">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
-                    <input type="hidden" name="identifier" value="{{ r.identifier }}" />
-                    <button class="plc-btn primary" name="action" value="play_now" title="Play immediately">&#9654;</button>
-                  </form>
-                </td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-      {% elif search_term %}
-        <p class="plc-empty">No results for &ldquo;{{ search_term }}&rdquo;.</p>
-      {% endif %}
-    </div>
-
-    <div class="plc-panel">
-      <h5>Radio / direct stream</h5>
-      <p class="plc-hint">Paste a direct stream or radio URL (Icecast/Shoutcast, .mp3, .m3u8, and so on).</p>
-      <form method="POST" class="plc-row">
-        <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
-        <input class="plc-input" type="text" name="identifier" placeholder="https://stream.example.com/live.mp3" />
-        <button class="plc-btn" name="action" value="play">Queue</button>
-        <button class="plc-btn primary" name="action" value="play_now">Play now</button>
-      </form>
-    </div>
-
+    <h4>{{ "Not connected" }}</h4>
+    <p>Join a voice channel and play something below &mdash; I'll connect automatically.</p>
   </div>
 {% else %}
-  <div class="plc-wrap">
+<div class="plc">
 
-    <div class="plc-now">
-      {% if player_state.current and player_state.current.artwork %}
-        <img class="plc-art" src="{{ player_state.current.artwork }}" alt="" />
+  <div class="plc-now">
+    {% if player_state.current and player_state.current.artwork %}
+      <div class="plc-now-bg" style="background-image:url('{{ player_state.current.artwork }}');"></div>
+      <img class="plc-art" src="{{ player_state.current.artwork }}" alt="" />
+    {% else %}
+      <div class="plc-art plc-art-ph"></div>
+    {% endif %}
+
+    <div class="plc-meta">
+      {% if player_state.current %}
+        <p class="plc-title" title="{{ player_state.current.title }}">{{ player_state.current.title }}</p>
+        <p class="plc-author">{{ player_state.current.author }}</p>
+        <div class="plc-badges">
+          {% if player_state.current.stream %}<span class="plc-badge live">Live</span>{% endif %}
+          {% if player_state.paused %}<span class="plc-badge">Paused</span>{% endif %}
+          {% if player_state.channel %}<span class="plc-badge"><i class="fa fa-volume-up"></i> {{ player_state.channel }}</span>{% endif %}
+          <span class="plc-badge"><i class="fa fa-list-ol"></i> {{ player_state.queue_length }} queued</span>
+        </div>
       {% else %}
-        <div class="plc-art"></div>
-      {% endif %}
-      <div class="plc-meta">
-        {% if player_state.current %}
-          <p class="plc-title">{{ player_state.current.title }}</p>
-          <p class="plc-author">{{ player_state.current.author }}</p>
-          <div class="plc-badges">
-            <span class="plc-badge">{{ player_state.current.duration }}</span>
-            {% if player_state.current.stream %}<span class="plc-badge">LIVE</span>{% endif %}
-            {% if player_state.paused %}<span class="plc-badge">Paused</span>{% endif %}
-            {% if player_state.channel %}<span class="plc-badge">{{ player_state.channel }}</span>{% endif %}
-          </div>
-        {% else %}
-          <p class="plc-title">Nothing playing</p>
-          <p class="plc-author">The queue is idle.</p>
-        {% endif %}
-      </div>
-    </div>
-
-    <form method="POST" class="plc-controls">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
-      <button class="plc-btn" name="action" value="previous" title="Previous">&#9198;</button>
-      {% if player_state.paused %}
-        <button class="plc-btn primary" name="action" value="resume" title="Resume">&#9654; Resume</button>
-      {% else %}
-        <button class="plc-btn primary" name="action" value="pause" title="Pause">&#10073;&#10073; Pause</button>
-      {% endif %}
-      <button class="plc-btn" name="action" value="skip" title="Skip">&#9197;</button>
-      <button class="plc-btn" name="action" value="shuffle" title="Shuffle queue">&#128256; Shuffle</button>
-      <button class="plc-btn danger" name="action" value="stop" title="Stop and clear queue">&#9632; Stop</button>
-      <button class="plc-btn danger" name="action" value="disconnect" title="Disconnect">Disconnect</button>
-    </form>
-
-    <form method="POST" class="plc-controls">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
-      <button class="plc-btn" name="action" value="repeat_track" title="Repeat current track">&#128257; Repeat track</button>
-      <button class="plc-btn" name="action" value="repeat_queue" title="Repeat queue">&#128256; Repeat queue</button>
-      <button class="plc-btn" name="action" value="repeat_off" title="Turn repeat off">Repeat off</button>
-      <button class="plc-btn danger" name="action" value="clear_queue" title="Empty the queue">Clear queue</button>
-    </form>
-
-    <form method="POST" class="plc-vol">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
-      <label class="plc-label" for="plcSeek">Seek to (seconds)</label>
-      <input class="plc-input" style="max-width:120px;" id="plcSeek" type="number" name="position" min="0" step="1" value="0" />
-      <button class="plc-btn" name="action" value="seek">Go</button>
-    </form>
-
-    <form method="POST" class="plc-vol">
-      <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
-      <button class="plc-btn" name="action" value="volume_down" title="Volume down">&#8722;</button>
-      <input type="range" name="volume" min="0" max="150" value="{{ player_state.volume }}"
-             oninput="document.getElementById('plcVolOut').textContent = this.value + '%';" />
-      <span id="plcVolOut">{{ player_state.volume }}%</span>
-      <button class="plc-btn" name="action" value="volume_set">Set</button>
-      <button class="plc-btn" name="action" value="volume_up" title="Volume up">+</button>
-    </form>
-
-    <div>
-      <h5>Queue &mdash; {{ player_state.queue_length }} track(s)</h5>
-      {% if player_state.queue %}
-        <table class="plc-queue">
-          <thead>
-            <tr><th>#</th><th>Title</th><th>Artist</th><th>Length</th><th></th></tr>
-          </thead>
-          <tbody>
-            {% for item in player_state.queue %}
-              <tr>
-                <td>{{ item.position }}</td>
-                <td>{% if item.uri %}<a href="{{ item.uri }}" target="_blank">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}</td>
-                <td>{{ item.author }}</td>
-                <td>{{ item.duration }}</td>
-                <td style="width:1%;white-space:nowrap;">
-                  <form method="POST" style="display:inline;">
-                    <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
-                    <input type="hidden" name="index" value="{{ loop.index0 }}" />
-                    <button class="plc-btn danger" name="action" value="remove_track" title="Remove">&times;</button>
-                  </form>
-                </td>
-              </tr>
-            {% endfor %}
-          </tbody>
-        </table>
-        {% if player_state.queue_length > 25 %}
-          <p class="plc-empty">Showing the first 25 of {{ player_state.queue_length }} tracks.</p>
-        {% endif %}
-      {% else %}
-        <p class="plc-empty">The queue is empty.</p>
+        <p class="plc-title">Nothing playing</p>
+        <p class="plc-author">The queue is idle.</p>
       {% endif %}
     </div>
+
+    <div class="plc-viz{% if player_state.paused or not player_state.current %} paused{% endif %}">
+      {% for h in [40, 70, 100, 55, 85, 30, 65, 95, 45, 75, 35, 60] %}
+        <i style="height:{{ h }}%; animation-duration:{{ 600 + h * 6 }}ms; animation-delay:{{ h * 4 }}ms;"></i>
+      {% endfor %}
+    </div>
+  </div>
+
+  {% if player_state.current and not player_state.current.stream and player_state.current.duration_ms %}
+    <form method="POST" class="plc-seek">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+      <span class="plc-time">{{ player_state.position }}</span>
+      <input type="range" name="position" min="0"
+             max="{{ (player_state.current.duration_ms / 1000)|int }}"
+             value="{{ (player_state.position_ms / 1000)|int }}"
+             oninput="document.getElementById('plcSeekOut').textContent = this.value;" />
+      <span class="plc-time">{{ player_state.current.duration }}</span>
+      <button class="plc-btn" name="action" value="seek" title="Seek to position">
+        <i class="fa fa-location-arrow"></i> Seek
+      </button>
+      <span class="plc-time" id="plcSeekOut" style="opacity:.45;"></span>
+    </form>
+  {% endif %}
+
+  <form method="POST" class="plc-controls">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+    <button class="plc-btn round" name="action" value="previous" title="Previous"><i class="fa fa-step-backward"></i></button>
+    {% if player_state.paused %}
+      <button class="plc-btn play" name="action" value="resume" title="Resume"><i class="fa fa-play"></i></button>
+    {% else %}
+      <button class="plc-btn play" name="action" value="pause" title="Pause"><i class="fa fa-pause"></i></button>
+    {% endif %}
+    <button class="plc-btn round" name="action" value="skip" title="Skip"><i class="fa fa-step-forward"></i></button>
+    <button class="plc-btn" name="action" value="shuffle" title="Shuffle the queue"><i class="fa fa-random"></i> Shuffle</button>
+    <button class="plc-btn" name="action" value="repeat_track" title="Repeat current track"><i class="fa fa-repeat"></i> Track</button>
+    <button class="plc-btn" name="action" value="repeat_queue" title="Repeat the queue"><i class="fa fa-refresh"></i> Queue</button>
+    <button class="plc-btn" name="action" value="repeat_off" title="Turn repeat off"><i class="fa fa-ban"></i> Off</button>
+    <button class="plc-btn danger" name="action" value="stop" title="Stop and clear"><i class="fa fa-stop"></i></button>
+    <button class="plc-btn danger" name="action" value="clear_queue" title="Empty the queue"><i class="fa fa-trash-o"></i> Queue</button>
+    <button class="plc-btn danger" name="action" value="disconnect" title="Disconnect"><i class="fa fa-sign-out"></i></button>
+  </form>
+
+  <form method="POST" class="plc-seek">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+    <button class="plc-btn round" name="action" value="volume_down" title="Volume down"><i class="fa fa-volume-down"></i></button>
+    <input type="range" name="volume" min="0" max="150" value="{{ player_state.volume }}"
+           oninput="document.getElementById('plcVolOut').textContent = this.value + '%';" />
+    <span class="plc-time" id="plcVolOut">{{ player_state.volume }}%</span>
+    <button class="plc-btn" name="action" value="volume_set"><i class="fa fa-check"></i> Set</button>
+    <button class="plc-btn round" name="action" value="volume_up" title="Volume up"><i class="fa fa-volume-up"></i></button>
+  </form>
+
+  <div>
+    <p class="plc-sec-title">Queue &mdash; {{ player_state.queue_length }} track(s)</p>
+    {% if player_state.queue %}
+      <table class="plc-q">
+        <thead><tr><th>#</th><th>Title</th><th>Artist</th><th>Length</th><th></th></tr></thead>
+        <tbody>
+          {% for item in player_state.queue %}
+            <tr>
+              <td style="opacity:.5;">{{ item.position }}</td>
+              <td>{% if item.uri %}<a href="{{ item.uri }}" target="_blank">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}</td>
+              <td style="opacity:.7;">{{ item.author }}</td>
+              <td style="opacity:.7;">{{ item.duration }}</td>
+              <td style="width:1%;">
+                <form method="POST" style="display:inline;">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+                  <input type="hidden" name="index" value="{{ loop.index0 }}" />
+                  <button class="plc-btn round danger" name="action" value="remove_track" title="Remove"><i class="fa fa-times"></i></button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% if player_state.queue_length > 25 %}
+        <p class="plc-empty">Showing the first 25 of {{ player_state.queue_length }} tracks.</p>
+      {% endif %}
+    {% else %}
+      <p class="plc-empty">The queue is empty.</p>
+    {% endif %}
+  </div>
 
   <div class="plc-panels">
-
     <div class="plc-panel">
-      <h5>Search &amp; play</h5>
-      <p class="plc-hint">Search YouTube (and every other source your nodes support), then queue a result.</p>
+      <h5><i class="fa fa-search me-1"></i> Search &amp; play</h5>
+      <p class="plc-hint">Searches YouTube and any other source your nodes support.</p>
       <form method="POST" class="plc-row">
         <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
-        <input class="plc-input" type="text" name="query" placeholder="Search for a song, artist, or paste a link..."
+        <input class="plc-input" type="text" name="query" placeholder="Song, artist, or a link..."
                value="{{ search_term or '' }}" />
-        <button class="plc-btn primary" name="action" value="search">Search</button>
+        <button class="plc-btn" name="action" value="search"><i class="fa fa-search"></i> Search</button>
       </form>
 
       {% if search_results %}
-        <table class="plc-queue" style="margin-top:12px;">
-          <thead><tr><th></th><th>Title</th><th>Artist</th><th>Length</th><th></th></tr></thead>
+        <table class="plc-q" style="margin-top:12px;">
           <tbody>
             {% for r in search_results %}
               <tr>
-                <td style="width:52px;">
-                  {% if r.artwork %}<img src="{{ r.artwork }}" alt="" style="width:44px;height:44px;border-radius:6px;object-fit:cover;" />{% endif %}
+                <td style="width:54px;">
+                  {% if r.artwork %}<img class="plc-thumb" src="{{ r.artwork }}" alt="" />{% endif %}
                 </td>
-                <td>{% if r.uri %}<a href="{{ r.uri }}" target="_blank">{{ r.title }}</a>{% else %}{{ r.title }}{% endif %}</td>
-                <td>{{ r.author }}</td>
-                <td>{% if r.stream %}LIVE{% else %}{{ r.duration }}{% endif %}</td>
-                <td style="white-space:nowrap;">
+                <td>
+                  {% if r.uri %}<a href="{{ r.uri }}" target="_blank">{{ r.title }}</a>{% else %}{{ r.title }}{% endif %}
+                  <div style="opacity:.6; font-size:.8rem;">{{ r.author }}</div>
+                </td>
+                <td style="opacity:.7; width:70px;">{% if r.stream %}Live{% else %}{{ r.duration }}{% endif %}</td>
+                <td style="white-space:nowrap; width:1%;">
                   <form method="POST" style="display:inline;">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
                     <input type="hidden" name="identifier" value="{{ r.identifier }}" />
-                    <button class="plc-btn" name="action" value="play" title="Add to queue">+ Queue</button>
+                    <button class="plc-btn round" name="action" value="play" title="Add to queue"><i class="fa fa-plus"></i></button>
                   </form>
                   <form method="POST" style="display:inline;">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
                     <input type="hidden" name="identifier" value="{{ r.identifier }}" />
-                    <button class="plc-btn primary" name="action" value="play_now" title="Play immediately">&#9654;</button>
+                    <button class="plc-btn round play" style="width:44px;height:44px;" name="action" value="play_now" title="Play now"><i class="fa fa-play"></i></button>
                   </form>
                 </td>
               </tr>
@@ -652,18 +643,17 @@ PLAYER_TEMPLATE = """
     </div>
 
     <div class="plc-panel">
-      <h5>Radio / direct stream</h5>
-      <p class="plc-hint">Paste a direct stream or radio URL (Icecast/Shoutcast, .mp3, .m3u8, and so on).</p>
+      <h5><i class="fa fa-rss me-1"></i> Radio / direct stream</h5>
+      <p class="plc-hint">Icecast/Shoutcast, .mp3, .m3u8 and similar direct URLs.</p>
       <form method="POST" class="plc-row">
         <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
         <input class="plc-input" type="text" name="identifier" placeholder="https://stream.example.com/live.mp3" />
-        <button class="plc-btn" name="action" value="play">Queue</button>
-        <button class="plc-btn primary" name="action" value="play_now">Play now</button>
+        <button class="plc-btn" name="action" value="play"><i class="fa fa-plus"></i> Queue</button>
+        <button class="plc-btn play" style="width:auto;height:44px;border-radius:11px;padding:0 15px;" name="action" value="play_now"><i class="fa fa-play"></i> Play</button>
       </form>
     </div>
-
   </div>
 
-  </div>
+</div>
 {% endif %}
 """
