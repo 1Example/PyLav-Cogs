@@ -4,7 +4,8 @@ import logging
 import typing as t
 
 import discord
-from redbot.core import commands
+from redbot.core import bank, commands
+from redbot.core.errors import BalanceTooHigh  # noqa: F401
 
 from pylav.players.query.obj import Query
 
@@ -165,6 +166,15 @@ class DashboardIntegration:
                             "category": "warning",
                         }
                     ],
+                }
+
+        if action:
+            _is_staff = await self._dash_is_staff(user, member, guild)
+            _ok, _charge_msg = await self._dash_charge(member, guild, action, _is_staff)
+            if not _ok:
+                return {
+                    "status": 0,
+                    "notifications": [{"message": _charge_msg, "category": "warning"}],
                 }
 
         if action:
@@ -431,6 +441,39 @@ class DashboardIntegration:
             return (f"Added {len(tracks)} tracks to the queue.", "success")
         return ("Added to the queue." if not play_now else "Now playing.", "success")
 
+
+
+    # ---------- economy ----------
+    #
+    # Optional per-action charge. Costs live in the cog's own Config under
+    # `dashboard_action_costs`; an action missing from that mapping is free.
+    # Staff are never charged.
+
+    async def _dash_charge(self, member: discord.Member, guild: discord.Guild, action: str, is_staff: bool):
+        """Returns (ok, message). Charges the member if a cost is configured."""
+        if is_staff:
+            return True, None
+        try:
+            costs = await self._config.guild(guild).dashboard_action_costs()
+        except Exception:  # noqa: BLE001
+            return True, None
+        cost = int((costs or {}).get(action, 0) or 0)
+        if cost <= 0:
+            return True, None
+        try:
+            if not await bank.can_spend(member, cost):
+                currency = await bank.get_currency_name(guild)
+                balance = await bank.get_balance(member)
+                return False, (
+                    f"That costs {cost} {currency}, but you only have {balance}."
+                )
+            await bank.withdraw_credits(member, cost)
+            currency = await bank.get_currency_name(guild)
+            return True, f"Charged {cost} {currency}."
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Economy charge failed for %r", action)
+            # Never block playback because the economy backend misbehaved.
+            return True, None
 
     # ---------- guild favourites ----------
 
