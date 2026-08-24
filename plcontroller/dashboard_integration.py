@@ -41,29 +41,35 @@ class DashboardIntegration:
 
     # ---------- helpers ----------
 
-    async def _dash_check_perms(
-        self, user: discord.User, guild: discord.Guild
-    ) -> tuple[discord.Member | None, dict | None]:
-        """Returns (member, error_payload). error_payload is None when allowed."""
-        member = guild.get_member(user.id)
-        if member is None:
-            return None, {
-                "status": 1,
-                "error_title": "Member not found",
-                "error_message": "You are not a member of this guild.",
-            }
-        allowed = (
+    # Actions any guild member may perform. Everything else is staff-only.
+    LISTENER_ACTIONS = frozenset(
+        {
+            "pause", "resume", "skip", "previous", "shuffle",
+            "seek", "volume_up", "volume_down", "volume_set",
+            "search", "play", "play_now",
+            "fav_add", "fav_play", "fav_queue",
+        }
+    )
+
+    async def _dash_is_staff(self, user: discord.User, member: discord.Member, guild: discord.Guild) -> bool:
+        return (
             await self.bot.is_owner(user)
             or member.id == guild.owner_id
             or member.guild_permissions.administrator
             or await self.bot.is_admin(member)
             or await self.bot.is_mod(member)
         )
-        if not allowed:
+
+    async def _dash_check_perms(
+        self, user: discord.User, guild: discord.Guild
+    ) -> tuple[discord.Member | None, dict | None]:
+        """Any member of the guild may open the page; per-action gating happens later."""
+        member = guild.get_member(user.id)
+        if member is None:
             return None, {
                 "status": 1,
-                "error_title": "Insufficient permissions",
-                "error_message": "You need to be a moderator to control the player.",
+                "error_title": "Member not found",
+                "error_message": "You are not a member of this guild.",
             }
         return member, None
 
@@ -117,8 +123,19 @@ class DashboardIntegration:
                     "player_state": await self._dash_build_state(player),
                     "search_results": results,
                     "search_term": search_term,
+                    "favourites": await self._dash_fav_list(guild),
+                    "is_staff": await self._dash_is_staff(user, member, guild),
                     "csrf_token_value": (kwargs.get("csrf_token") or ("", ""))[1],
                 },
+            }
+
+        # --- guild favourites playlist ---
+        if action in ("fav_add", "fav_remove", "fav_play", "fav_queue", "fav_clear"):
+            message, category = await self._dash_favourites(action, member, guild, player, field)
+            return {
+                "status": 0,
+                "notifications": [{"message": message, "category": category}],
+                "redirect_url": kwargs.get("request_url"),
             }
 
         # --- play / enqueue: connects if needed ---
@@ -137,6 +154,18 @@ class DashboardIntegration:
                 "notifications": [{"message": message, "category": category}],
                 "redirect_url": kwargs.get("request_url"),
             }
+
+        if action and action not in self.LISTENER_ACTIONS:
+            if not await self._dash_is_staff(user, member, guild):
+                return {
+                    "status": 0,
+                    "notifications": [
+                        {
+                            "message": "Only moderators can do that. You can still play, pause, skip and queue music.",
+                            "category": "warning",
+                        }
+                    ],
+                }
 
         if action:
             if player is None:
@@ -215,6 +244,8 @@ class DashboardIntegration:
                 "csrf_token_value": (kwargs.get("csrf_token") or ("", ""))[1],
                 "search_results": [],
                 "search_term": "",
+                "favourites": await self._dash_fav_list(guild),
+                "is_staff": await self._dash_is_staff(user, member, guild),
             },
         }
 
@@ -400,6 +431,85 @@ class DashboardIntegration:
         return ("Added to the queue." if not play_now else "Now playing.", "success")
 
 
+    # ---------- guild favourites ----------
+
+    FAV_PLAYLIST_NAME = "Dashboard Favourites"
+
+    async def _dash_get_fav_playlist(self, guild: discord.Guild, author_id: int):
+        """Fetch (or create) the per-guild favourites playlist."""
+        # Guild-scoped playlists use the guild id as both identifier and scope.
+        return await self.pylav.playlist_db_manager.create_or_update_guild_playlist(
+            guild=guild, author=author_id, name=self.FAV_PLAYLIST_NAME
+        )
+
+    async def _dash_favourites(self, action, member, guild, player, field):
+        try:
+            playlist = await self._dash_get_fav_playlist(guild, member.id)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Could not open the guild favourites playlist")
+            return (f"Could not open the playlist: {exc}", "danger")
+
+        try:
+            if action == "fav_add":
+                identifier = (field("identifier") or "").strip()
+                if not identifier and player is not None and player.current is not None:
+                    identifier = await player.current.uri()
+                if not identifier:
+                    return ("Nothing to save.", "warning")
+                await playlist.add_track([identifier])
+                return ("Saved to the guild favourites.", "success")
+
+            if action == "fav_remove":
+                identifier = (field("identifier") or "").strip()
+                if not identifier:
+                    return ("Nothing to remove.", "warning")
+                await playlist.remove_track(identifier)
+                return ("Removed from the guild favourites.", "success")
+
+            if action == "fav_clear":
+                await playlist.remove_all_tracks()
+                return ("Cleared the guild favourites.", "success")
+
+            # fav_play / fav_queue
+            tracks = await playlist.fetch_tracks()
+            if not tracks:
+                return ("The guild favourites playlist is empty.", "warning")
+            play_now = action == "fav_play"
+            added = 0
+            for entry in tracks:
+                identifier = entry if isinstance(entry, str) else (entry or {}).get("encoded")
+                if not identifier:
+                    continue
+                message, category = await self._dash_play(
+                    member, guild, player, identifier, play_now=(play_now and added == 0)
+                )
+                if category == "danger":
+                    return (message, category)
+                player = self._dash_player(guild) or player
+                added += 1
+            return (f"Queued {added} track(s) from the guild favourites.", "success")
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Favourites action %r failed", action)
+            return (f"Favourites action failed: {exc}", "danger")
+
+    async def _dash_fav_list(self, guild: discord.Guild):
+        """Read-only listing of the favourites playlist for rendering."""
+        try:
+            playlist = await self.pylav.playlist_db_manager.create_or_update_guild_playlist(
+                guild=guild, author=self.bot.user.id, name=self.FAV_PLAYLIST_NAME
+            )
+            raw = await playlist.fetch_tracks()
+        except Exception:  # noqa: BLE001
+            log.exception("Could not read the guild favourites playlist")
+            return []
+        out = []
+        for entry in raw[:50]:
+            identifier = entry if isinstance(entry, str) else (entry or {}).get("encoded")
+            if identifier:
+                out.append({"identifier": identifier})
+        return out
+
+
 PLAYER_TEMPLATE = """
 <style>
   .plc { display:flex; flex-direction:column; gap:18px; }
@@ -548,12 +658,17 @@ PLAYER_TEMPLATE = """
     {% endif %}
     <button class="plc-btn round" name="action" value="skip" title="Skip"><i class="fa fa-step-forward"></i></button>
     <button class="plc-btn" name="action" value="shuffle" title="Shuffle the queue"><i class="fa fa-random"></i> Shuffle</button>
+    {% if player_state.current %}
+      <button class="plc-btn" name="action" value="fav_add" title="Save this track to the guild favourites"><i class="fa fa-star"></i> Favourite</button>
+    {% endif %}
     <button class="plc-btn" name="action" value="repeat_track" title="Repeat current track"><i class="fa fa-repeat"></i> Track</button>
     <button class="plc-btn" name="action" value="repeat_queue" title="Repeat the queue"><i class="fa fa-refresh"></i> Queue</button>
     <button class="plc-btn" name="action" value="repeat_off" title="Turn repeat off"><i class="fa fa-ban"></i> Off</button>
-    <button class="plc-btn danger" name="action" value="stop" title="Stop and clear"><i class="fa fa-stop"></i></button>
-    <button class="plc-btn danger" name="action" value="clear_queue" title="Empty the queue"><i class="fa fa-trash-o"></i> Queue</button>
-    <button class="plc-btn danger" name="action" value="disconnect" title="Disconnect"><i class="fa fa-sign-out"></i></button>
+    {% if is_staff %}
+      <button class="plc-btn danger" name="action" value="stop" title="Stop and clear"><i class="fa fa-stop"></i></button>
+      <button class="plc-btn danger" name="action" value="clear_queue" title="Empty the queue"><i class="fa fa-trash-o"></i> Queue</button>
+      <button class="plc-btn danger" name="action" value="disconnect" title="Disconnect"><i class="fa fa-sign-out"></i></button>
+    {% endif %}
   </form>
 
   <form method="POST" class="plc-seek">
@@ -653,6 +768,59 @@ PLAYER_TEMPLATE = """
       </form>
     </div>
   </div>
+
+  <div class="plc-panel">
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap;">
+      <div>
+        <h5><i class="fa fa-star me-1"></i> Guild favourites</h5>
+        <p class="plc-hint">Shared playlist for this server &mdash; any member can add to it.</p>
+      </div>
+      <form method="POST" class="plc-row">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+        <button class="plc-btn" name="action" value="fav_queue" title="Queue every favourite"><i class="fa fa-plus"></i> Queue all</button>
+        <button class="plc-btn play" style="width:auto;height:44px;border-radius:11px;padding:0 15px;" name="action" value="fav_play" title="Play the favourites now"><i class="fa fa-play"></i> Play all</button>
+        {% if is_staff %}
+          <button class="plc-btn danger" name="action" value="fav_clear" title="Remove every favourite"><i class="fa fa-trash-o"></i></button>
+        {% endif %}
+      </form>
+    </div>
+
+    {% if favourites %}
+      <table class="plc-q" style="margin-top:10px;">
+        <tbody>
+          {% for fav in favourites %}
+            <tr>
+              <td style="opacity:.5; width:34px;">{{ loop.index }}</td>
+              <td style="word-break:break-all; font-size:.82rem;">{{ fav.identifier }}</td>
+              <td style="white-space:nowrap; width:1%;">
+                <form method="POST" style="display:inline;">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+                  <input type="hidden" name="identifier" value="{{ fav.identifier }}" />
+                  <button class="plc-btn round" name="action" value="play" title="Queue"><i class="fa fa-plus"></i></button>
+                </form>
+                {% if is_staff %}
+                  <form method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+                    <input type="hidden" name="identifier" value="{{ fav.identifier }}" />
+                    <button class="plc-btn round danger" name="action" value="fav_remove" title="Remove"><i class="fa fa-times"></i></button>
+                  </form>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="plc-empty">No favourites yet. Hit <b>Favourite</b> while a track is playing.</p>
+    {% endif %}
+  </div>
+
+  {% if not is_staff %}
+    <p class="plc-hint" style="text-align:center;">
+      <i class="fa fa-info-circle"></i>
+      You can play, pause, skip and queue music. Stopping and disconnecting are moderator-only.
+    </p>
+  {% endif %}
 
 </div>
 {% endif %}
