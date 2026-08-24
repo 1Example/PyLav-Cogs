@@ -332,7 +332,8 @@ class DashboardIntegration:
             query = await Query.from_string(
                 search_term if looks_like_url else f"ytsearch:{search_term}"
             )
-            response = await self.pylav.search_query(query)
+            # fullsearch=True is required, otherwise PyLav returns only the first match.
+            response = await self.pylav.search_query(query, fullsearch=True)
         except Exception as exc:  # noqa: BLE001
             log.exception("Dashboard search failed for %r", search_term)
             return [], f"Search failed: {exc}"
@@ -685,7 +686,7 @@ PLAYER_TEMPLATE = """
     <p class="plc-sec-title">Queue &mdash; {{ player_state.queue_length }} track(s)</p>
     {% if player_state.queue %}
       <table class="plc-q">
-        <thead><tr><th>#</th><th>Title</th><th>Artist</th><th>Length</th><th></th></tr></thead>
+        <thead><tr><th>#</th><th>Title</th><th>Channel</th><th>Length</th><th></th></tr></thead>
         <tbody>
           {% for item in player_state.queue %}
             <tr>
