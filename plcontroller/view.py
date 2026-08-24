@@ -123,10 +123,18 @@ if TYPE_CHECKING:
 
 
 class IncreaseVolumeButton(discord.ui.Button):
-    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
         super().__init__(
             style=style,
             emoji=emojis.VOLUME_UP,
+            label=label,
             row=row,
             custom_id=custom_id,
         )
@@ -141,10 +149,18 @@ class IncreaseVolumeButton(discord.ui.Button):
 
 
 class DecreaseVolumeButton(discord.ui.Button):
-    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
         super().__init__(
             style=style,
             emoji=emojis.VOLUME_DOWN,
+            label=label,
             row=row,
             custom_id=custom_id,
         )
@@ -159,10 +175,18 @@ class DecreaseVolumeButton(discord.ui.Button):
 
 
 class StopTrackButton(discord.ui.Button):
-    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
         super().__init__(
             style=style,
             emoji=emojis.STOP,
+            label=label,
             row=row,
             custom_id=custom_id,
         )
@@ -177,10 +201,18 @@ class StopTrackButton(discord.ui.Button):
 
 
 class PauseTrackButton(discord.ui.Button):
-    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
         super().__init__(
             style=style,
             emoji=emojis.PAUSE,
+            label=label,
             row=row,
             custom_id=custom_id,
         )
@@ -195,10 +227,18 @@ class PauseTrackButton(discord.ui.Button):
 
 
 class ResumeTrackButton(discord.ui.Button):
-    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
         super().__init__(
             style=style,
             emoji=emojis.PLAY,
+            label=label,
             row=row,
             custom_id=custom_id,
         )
@@ -213,10 +253,18 @@ class ResumeTrackButton(discord.ui.Button):
 
 
 class SkipTrackButton(discord.ui.Button):
-    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
         super().__init__(
             style=style,
             emoji=emojis.NEXT,
+            label=label,
             row=row,
             custom_id=custom_id,
         )
@@ -231,10 +279,18 @@ class SkipTrackButton(discord.ui.Button):
 
 
 class ToggleRepeatButton(discord.ui.Button):
-    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
         super().__init__(
             style=style,
             emoji=emojis.LOOP,
+            label=label,
             row=row,
             custom_id=custom_id,
         )
@@ -257,10 +313,18 @@ class ToggleRepeatButton(discord.ui.Button):
 
 
 class QueueHistoryButton(discord.ui.Button):
-    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
         super().__init__(
             style=style,
             emoji=emojis.PLAYLIST,
+            label=label,
             row=row,
             custom_id=custom_id,
         )
@@ -482,10 +546,18 @@ def get_controller_queue_menu():
 
 
 class QueueButton(discord.ui.Button):
-    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
         super().__init__(
             style=style,
             emoji=emojis.QUEUE,
+            label=label,
             row=row,
             custom_id=custom_id,
         )
@@ -523,10 +595,18 @@ class QueueButton(discord.ui.Button):
 
 
 class ToggleRepeatQueueButton(discord.ui.Button):
-    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
         super().__init__(
             style=style,
             emoji=emojis.REPEAT,
+            label=label,
             row=row,
             custom_id=custom_id,
         )
@@ -550,10 +630,18 @@ class ToggleRepeatQueueButton(discord.ui.Button):
 
 
 class ShuffleButton(discord.ui.Button):
-    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
         super().__init__(
             style=style,
             emoji=emojis.RANDOM,
+            label=label,
             row=row,
             custom_id=custom_id,
         )
@@ -568,10 +656,18 @@ class ShuffleButton(discord.ui.Button):
 
 
 class PreviousTrackButton(discord.ui.Button):
-    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
         super().__init__(
             style=style,
             emoji=emojis.PREVIOUS,
+            label=label,
             row=row,
             custom_id=custom_id,
         )
@@ -586,10 +682,18 @@ class PreviousTrackButton(discord.ui.Button):
 
 
 class RefreshButton(discord.ui.Button):
-    def __init__(self, cog: PyLavController, style: discord.ButtonStyle, row: int = None, custom_id: str | None = None):
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
         super().__init__(
             style=style,
             emoji=emojis.UPDATE,
+            label=label,
             row=row,
             custom_id=custom_id,
         )
@@ -620,37 +724,43 @@ class PersistentControllerView(discord.ui.View):
         # Row 0 - playback controls
         self.previous_track_button = PreviousTrackButton(
             style=TRANSPARENT,
+            label=_("Back"),
             row=0,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:previous_track_button:9",
         )
         self.paused_button = PauseTrackButton(
             style=TRANSPARENT,
+            label=_("Pause"),
             row=0,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:paused_button:7",
         )
         self.resume_button = ResumeTrackButton(
             style=TRANSPARENT,
+            label=_("Resume"),
             row=0,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:resume_button:8",
         )
         self.skip_button = SkipTrackButton(
             style=TRANSPARENT,
+            label=_("Skip"),
             row=0,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:skip_button:10",
         )
         self.shuffle_button = ShuffleButton(
             style=TRANSPARENT,
+            label=_("Shuffle"),
             row=0,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:shuffle_button:11",
         )
         self.stop_button = StopTrackButton(
             style=TRANSPARENT,
-            row=0,
+            label=_("Stop"),
+            row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:stop_button:12",
         )
@@ -658,43 +768,50 @@ class PersistentControllerView(discord.ui.View):
         # Row 1 - volume, repeat and queue
         self.decrease_volume_button = DecreaseVolumeButton(
             style=TRANSPARENT,
+            label=_("Vol -"),
             row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:decrease_volume_button:5",
         )
         self.increase_volume_button = IncreaseVolumeButton(
             style=TRANSPARENT,
+            label=_("Vol +"),
             row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:increase_volume_button:6",
         )
         self.repeat_queue_button_on = ToggleRepeatQueueButton(
             style=TRANSPARENT,
-            row=1,
+            label=_("Loop queue"),
+            row=2,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:repeat_queue_button_on:1",
         )
         self.repeat_button_on = ToggleRepeatButton(
             style=TRANSPARENT,
-            row=1,
+            label=_("Loop"),
+            row=2,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:repeat_button_on:2",
         )
         self.repeat_button_off = ToggleRepeatButton(
             style=TRANSPARENT,
-            row=1,
+            label=_("Loop off"),
+            row=2,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:repeat_button_off:3",
         )
         self.queue_button = QueueButton(
             style=TRANSPARENT,
-            row=1,
+            label=_("Queue"),
+            row=3,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:queue_button:14",
         )
         self.show_history_button = QueueHistoryButton(
             style=TRANSPARENT,
-            row=1,
+            label=_("History"),
+            row=3,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:show_history_button:4",
         )
@@ -702,7 +819,8 @@ class PersistentControllerView(discord.ui.View):
         # Row 2 - utility
         self.refresh_button = RefreshButton(
             style=TRANSPARENT,
-            row=2,
+            label=_("Refresh"),
+            row=3,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:refresh_button:13",
         )
@@ -938,7 +1056,7 @@ class PersistentControllerView(discord.ui.View):
                 )
             }
         return await player.get_currently_playing_message(
-            embed=True, messageable=self.channel, progress=False, show_help=self.__show_help
+            embed=True, messageable=self.channel, progress=True, show_help=self.__show_help
         )
 
     async def update_view(self, forced: bool = False):
