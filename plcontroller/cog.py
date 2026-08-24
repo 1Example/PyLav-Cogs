@@ -54,10 +54,28 @@ class PyLavController(
             persistent_view_message_id=None,
             enable_antispam=True,
             use_slow_mode=True,
-            # Optional per-action credit costs for the web dashboard, e.g.
-            # {"skip": 50, "play": 25}. Empty means everything is free.
-            # Staff are never charged. Set via [p]plcontrollerset cost.
-            dashboard_action_costs={},
+            # Per-action credit costs for the web dashboard. Staff are never
+            # charged. "Play now" jumps the queue so it costs more than queueing.
+            # Tune with [p]plcontrollerset cost <action> <amount>, 0 = free.
+            dashboard_action_costs={
+                "play": 25,
+                "play_now": 100,
+                "fav_play": 100,
+                "fav_queue": 25,
+                "fav_add": 10,
+                "search": 5,
+                "skip": 50,
+                "previous": 50,
+                "pause": 10,
+                "resume": 10,
+                "shuffle": 30,
+                "seek": 20,
+                "volume_set": 10,
+                "volume_up": 10,
+                "volume_down": 10,
+            },
+            # Master switch - flip off to make the dashboard player free again.
+            dashboard_economy_enabled=True,
         )
         self._config.register_guild(**self.__defaults)
         self._config.register_global(
