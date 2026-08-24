@@ -530,11 +530,18 @@ class DashboardIntegration:
     FAV_PLAYLIST_NAME = "Dashboard Favourites"
 
     async def _dash_get_fav_playlist(self, guild: discord.Guild, author_id: int):
-        """Fetch (or create) the per-guild favourites playlist."""
-        # Guild-scoped playlists use the guild id as both identifier and scope.
-        return await self.pylav.playlist_db_manager.create_or_update_guild_playlist(
-            guild=guild, author=author_id, name=self.FAV_PLAYLIST_NAME
-        )
+        """Fetch the guild favourites playlist, creating it only if missing.
+
+        IMPORTANT: create_or_update_guild_playlist() runs `tracks=tracks or []`,
+        so calling it on an existing playlist WIPES every track. It must only be
+        used for first-time creation - reads go through get_playlist().
+        """
+        playlist = self.pylav.playlist_db_manager.get_playlist(identifier=guild.id)
+        if not await playlist.exists():
+            playlist = await self.pylav.playlist_db_manager.create_or_update_guild_playlist(
+                guild=guild, author=author_id, name=self.FAV_PLAYLIST_NAME, tracks=[]
+            )
+        return playlist
 
     async def _dash_favourites(self, action, member, guild, player, field):
         try:
@@ -547,9 +554,12 @@ class DashboardIntegration:
             if action == "fav_add":
                 identifier = (field("identifier") or "").strip()
                 if not identifier and player is not None and player.current is not None:
-                    identifier = await player.current.uri()
+                    identifier = player.current.encoded or await player.current.uri()
                 if not identifier:
                     return ("Nothing to save.", "warning")
+                existing = await playlist.fetch_tracks() or []
+                if identifier in existing:
+                    return ("That track is already in the favourites.", "warning")
                 await playlist.add_track([identifier])
                 return ("Saved to the guild favourites.", "success")
 
@@ -564,8 +574,7 @@ class DashboardIntegration:
                 await playlist.remove_all_tracks()
                 return ("Cleared the guild favourites.", "success")
 
-            # fav_play / fav_queue
-            tracks = await playlist.fetch_tracks()
+            tracks = await playlist.fetch_tracks() or []
             if not tracks:
                 return ("The guild favourites playlist is empty.", "warning")
             play_now = action == "fav_play"
@@ -587,20 +596,29 @@ class DashboardIntegration:
             return (f"Favourites action failed: {exc}", "danger")
 
     async def _dash_fav_list(self, guild: discord.Guild):
-        """Read-only listing of the favourites playlist for rendering."""
+        """Read-only listing. Must never call create_or_update (it wipes tracks)."""
         try:
-            playlist = await self.pylav.playlist_db_manager.create_or_update_guild_playlist(
-                guild=guild, author=self.bot.user.id, name=self.FAV_PLAYLIST_NAME
-            )
-            raw = await playlist.fetch_tracks()
+            playlist = self.pylav.playlist_db_manager.get_playlist(identifier=guild.id)
+            if not await playlist.exists():
+                return []
+            raw = await playlist.fetch_tracks() or []
         except Exception:  # noqa: BLE001
             log.exception("Could not read the guild favourites playlist")
             return []
         out = []
         for entry in raw[:50]:
             identifier = entry if isinstance(entry, str) else (entry or {}).get("encoded")
-            if identifier:
-                out.append({"identifier": identifier})
+            if not identifier:
+                continue
+            title = identifier
+            try:
+                decoded = await self.pylav.decode_track(identifier, raise_on_failure=False)
+                info = getattr(decoded, "info", None)
+                if info is not None and getattr(info, "title", None):
+                    title = f"{info.title}" + (f" - {info.author}" if getattr(info, "author", None) else "")
+            except Exception:  # noqa: BLE001
+                pass
+            out.append({"identifier": identifier, "title": title})
         return out
 
 
@@ -919,7 +937,7 @@ PLAYER_TEMPLATE = """
           {% for fav in favourites %}
             <tr>
               <td style="opacity:.5; width:34px;">{{ loop.index }}</td>
-              <td style="word-break:break-all; font-size:.82rem;">{{ fav.identifier }}</td>
+              <td style="font-size:.86rem;">{{ fav.title }}</td>
               <td style="white-space:nowrap; width:1%;">
                 <form method="POST" style="display:inline;">
                   <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
