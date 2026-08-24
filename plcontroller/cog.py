@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 import discord
 from apscheduler.jobstores.base import JobLookupError
-from redbot.core import Config, commands
+from redbot.core import Config, bank, commands
 from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.antispam import AntiSpam
 from redbot.core.utils.chat_formatting import humanize_number
@@ -54,6 +54,10 @@ class PyLavController(
             persistent_view_message_id=None,
             enable_antispam=True,
             use_slow_mode=True,
+            # Optional per-action credit costs for the web dashboard, e.g.
+            # {"skip": 50, "play": 25}. Empty means everything is free.
+            # Staff are never charged. Set via [p]plcontrollerset cost.
+            dashboard_action_costs={},
         )
         self._config.register_guild(**self.__defaults)
         self._config.register_global(
@@ -136,6 +140,39 @@ class PyLavController(
     @commands.admin_or_permissions(manage_guild=True)
     async def command_plcontrollerset(self, context: PyLavContext):
         """Configure the PyLav Controller."""
+
+    @command_plcontrollerset.command(name="cost")
+    async def command_plcontrollerset_cost(self, context: PyLavContext, action: str, amount: int) -> None:
+        """Set what a web-dashboard audio action costs a normal member.
+
+        Use an amount of 0 to make the action free again. Moderators are never
+        charged. Valid actions include: play, play_now, skip, previous, pause,
+        resume, shuffle, seek, volume_set, volume_up, volume_down, search,
+        fav_add, fav_play, fav_queue.
+        """
+        action = action.strip().lower()
+        if amount < 0:
+            await context.send("The amount cannot be negative.")
+            return
+        async with self._config.guild(context.guild).dashboard_action_costs() as costs:
+            if amount == 0:
+                costs.pop(action, None)
+                await context.send(f"`{action}` is now free.")
+            else:
+                costs[action] = amount
+                currency = await bank.get_currency_name(context.guild)
+                await context.send(f"`{action}` now costs {amount} {currency}.")
+
+    @command_plcontrollerset.command(name="costs")
+    async def command_plcontrollerset_costs(self, context: PyLavContext) -> None:
+        """Show the configured web-dashboard action costs."""
+        costs = await self._config.guild(context.guild).dashboard_action_costs()
+        if not costs:
+            await context.send("No actions cost anything; the dashboard player is free to use.")
+            return
+        currency = await bank.get_currency_name(context.guild)
+        lines = "\n".join(f"- {name}: {value} {currency}" for name, value in sorted(costs.items()))
+        await context.send(f"Web dashboard action costs:\n{lines}")
 
     @command_plcontrollerset.command(name="channel")
     async def command_plcontrollerset_channel(
