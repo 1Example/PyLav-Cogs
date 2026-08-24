@@ -85,7 +85,8 @@ class DashboardIntegration:
         player = self._dash_player(guild)
 
         # --- handle an action, if one was submitted ---
-        action = (kwargs.get("data") or {}).get("action") or kwargs.get("action")
+        form_data = (kwargs.get("data") or {}).get("form") or {}
+        action = form_data.get("action") if kwargs.get("method") == "POST" else None
         if action:
             if player is None:
                 return {
@@ -115,7 +116,7 @@ class DashboardIntegration:
                 elif action == "volume_down":
                     await player.set_volume(max(player.volume - 5, 0), member)
                 elif action == "volume_set":
-                    raw = (kwargs.get("data") or {}).get("volume") or kwargs.get("volume")
+                    raw = form_data.get("volume")
                     await player.set_volume(max(0, min(int(raw), 1000)), member)
                 else:
                     return {
@@ -141,30 +142,47 @@ class DashboardIntegration:
             "status": 0,
             "web_content": {
                 "source": PLAYER_TEMPLATE,
-                "player_state": self._dash_build_state(player),
+                "player_state": await self._dash_build_state(player),
+                # kwargs["csrf_token"] is (raw, signed); the signed value goes in the form.
+                "csrf_token_value": (kwargs.get("csrf_token") or ("", ""))[1],
             },
         }
 
-    def _dash_build_state(self, player) -> dict[str, t.Any]:
+    async def _dash_track_dict(self, track, position: int | None = None) -> dict[str, t.Any]:
+        """PyLav track fields are async methods, so each one must be awaited."""
+
+        async def safe(coro_method, default):
+            if coro_method is None:
+                return default
+            try:
+                value = await coro_method()
+            except Exception:  # noqa: BLE001 - a single bad field shouldn't kill the page
+                return default
+            return default if value is None else value
+
+        data = {
+            "title": await safe(getattr(track, "title", None), "Unknown title"),
+            "author": await safe(getattr(track, "author", None), ""),
+            "uri": await safe(getattr(track, "uri", None), ""),
+            "duration": _fmt_ms(await safe(getattr(track, "duration", None), 0)),
+        }
+        if position is not None:
+            data["position"] = position
+        return data
+
+    async def _dash_build_state(self, player) -> dict[str, t.Any]:
         if player is None:
             return {"connected": False}
 
         current = player.current
-        queue_items = []
         try:
-            raw_queue = player.queue.raw_queue
+            raw_queue = list(player.queue.raw_queue)
         except Exception:  # noqa: BLE001 - queue internals vary by version
             raw_queue = []
-        for index, track in enumerate(list(raw_queue)[:25], start=1):
-            queue_items.append(
-                {
-                    "position": index,
-                    "title": getattr(track, "title", None) or "Unknown title",
-                    "author": getattr(track, "author", None) or "",
-                    "duration": _fmt_ms(getattr(track, "duration", 0)),
-                    "uri": getattr(track, "uri", None) or "",
-                }
-            )
+
+        queue_items = []
+        for index, track in enumerate(raw_queue[:25], start=1):
+            queue_items.append(await self._dash_track_dict(track, position=index))
 
         state: dict[str, t.Any] = {
             "connected": True,
@@ -172,22 +190,22 @@ class DashboardIntegration:
             "playing": bool(player.is_playing),
             "volume": int(player.volume),
             "channel": getattr(getattr(player, "channel", None), "name", ""),
-            "queue_length": len(list(raw_queue)),
+            "queue_length": len(raw_queue),
             "queue": queue_items,
             "current": None,
         }
 
         if current is not None:
-            state["current"] = {
-                "title": getattr(current, "title", None) or "Unknown title",
-                "author": getattr(current, "author", None) or "",
-                "uri": getattr(current, "uri", None) or "",
-                "artwork": getattr(current, "artworkUrl", None)
-                or getattr(current, "thumbnail", None)
-                or "",
-                "duration": _fmt_ms(getattr(current, "duration", 0)),
-                "stream": bool(getattr(current, "stream", False)),
-            }
+            current_data = await self._dash_track_dict(current)
+            try:
+                current_data["artwork"] = await current.artworkUrl() or ""
+            except Exception:  # noqa: BLE001
+                current_data["artwork"] = ""
+            try:
+                current_data["stream"] = bool(await current.stream())
+            except Exception:  # noqa: BLE001
+                current_data["stream"] = False
+            state["current"] = current_data
         return state
 
 
@@ -268,7 +286,7 @@ PLAYER_TEMPLATE = """
     </div>
 
     <form method="POST" class="plc-controls">
-      {{ form_csrf if form_csrf }}
+      <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
       <button class="plc-btn" name="action" value="previous" title="Previous">&#9198;</button>
       {% if player_state.paused %}
         <button class="plc-btn primary" name="action" value="resume" title="Resume">&#9654; Resume</button>
@@ -282,7 +300,7 @@ PLAYER_TEMPLATE = """
     </form>
 
     <form method="POST" class="plc-vol">
-      {{ form_csrf if form_csrf }}
+      <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
       <button class="plc-btn" name="action" value="volume_down" title="Volume down">&#8722;</button>
       <input type="range" name="volume" min="0" max="150" value="{{ player_state.volume }}"
              oninput="document.getElementById('plcVolOut').textContent = this.value + '%';" />
