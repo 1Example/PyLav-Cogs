@@ -565,33 +565,52 @@ class QueueButton(discord.ui.Button):
 
     async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
         if not interaction.response.is_done():
-            await interaction.response.defer()
-        context = await self.cog.bot.get_context(interaction)
-        if not (player := context.player):
-            return await context.send(
+            await interaction.response.defer(ephemeral=True)
+        player = self.cog.pylav.get_player(interaction.guild.id)
+        if player is None:
+            return await interaction.followup.send(
                 embed=await self.cog.pylav.construct_embed(
-                    description=_("I am not connected to any voice channel at the moment."), messageable=interaction
+                    description=_("I am not connected to any voice channel at the moment."),
+                    messageable=interaction,
                 ),
-                delete_after=PUBLIC_DELETE_AFTER,
+                ephemeral=True,
             )
         if player.queue.empty():
-            return await context.send(
+            return await interaction.followup.send(
                 embed=await self.cog.pylav.construct_embed(
                     description=_("There is nothing in the queue."), messageable=interaction
                 ),
-                delete_after=PUBLIC_DELETE_AFTER,
+                ephemeral=True,
             )
-        from pylav.extension.red.ui.sources.queue import QueueSource
 
-        command_cog = resolve_command_cog(self.cog)
-        menu_cls = get_controller_queue_menu()
+        # Deliberately just the list - the transport controls live on the main
+        # controller, so this no longer opens a second full control panel.
+        lines = []
+        total_ms = 0
+        raw = list(player.queue.raw_queue)
+        for position, track in enumerate(raw[:25], start=1):
+            try:
+                title = await track.title()
+                author = await track.author()
+                duration = await track.duration() or 0
+            except Exception:  # noqa: BLE001
+                title, author, duration = _("Unknown title"), "", 0
+            total_ms += duration
+            lines.append(f"`{position:>2}.` **{title}**" + (f" — {author}" if author else ""))
 
-        await menu_cls(
-            cog=command_cog,
-            bot=self.cog.bot,
-            source=QueueSource(guild_id=interaction.guild.id, cog=command_cog),
-            original_author=interaction.user,
-        ).start(ctx=context)
+        description = "\n".join(lines) or _("There is nothing in the queue.")
+        if len(raw) > 25:
+            description += "\n\n" + _("...and {number} more.").format(number=len(raw) - 25)
+
+        await interaction.followup.send(
+            embed=await self.cog.pylav.construct_embed(
+                title=_("Queue for {guild}").format(guild=interaction.guild.name),
+                description=description,
+                footer=_("{tracks} track(s)").format(tracks=len(raw)),
+                messageable=interaction,
+            ),
+            ephemeral=True,
+        )
 
 
 class ToggleRepeatQueueButton(discord.ui.Button):
@@ -1108,9 +1127,111 @@ class PersistentControllerView(discord.ui.View):
                     footer=footer_text,
                 )
             }
-        return await player.get_currently_playing_message(
-            embed=True, messageable=self.channel, progress=True, show_help=self.__show_help
+        return {"embed": await self._build_now_playing_embed(player)}
+
+    @staticmethod
+    def _progress_bar(position: float, duration: float, length: int = 18) -> str:
+        if not duration or duration <= 0:
+            return "\u25b6\ufe0f  " + ("\u2501" * length) + "  \U0001f507 LIVE"
+        ratio = max(0.0, min(1.0, position / duration))
+        # Clamp so the knob always fits inside the bar; otherwise a track at
+        # exactly 100% renders one character wider than every other frame.
+        filled = min(int(ratio * length), length - 1)
+        return "\u2501" * filled + "\U0001f518" + "\u2501" * (length - filled - 1)
+
+    @staticmethod
+    def _fmt(milliseconds: float | int | None) -> str:
+        if not milliseconds or milliseconds < 0:
+            return "0:00"
+        total = int(milliseconds // 1000)
+        hours, rem = divmod(total, 3600)
+        minutes, seconds = divmod(rem, 60)
+        return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+
+    async def _build_now_playing_embed(self, player) -> discord.Embed:
+        """Custom Now Playing card.
+
+        Replaces PyLav's get_currently_playing_message(), which rendered a long
+        block of search-prefix help and stacked every field vertically.
+        """
+        track = player.current
+
+        async def safe(coro, default=""):
+            try:
+                value = await coro()
+            except Exception:  # noqa: BLE001
+                return default
+            return default if value is None else value
+
+        title = await safe(track.title, _("Unknown title"))
+        author = await safe(track.author)
+        uri = await safe(track.uri)
+        artwork = await safe(track.artworkUrl)
+        duration = await safe(track.duration, 0)
+        is_stream = bool(await safe(track.stream, False))
+        try:
+            position = await player.position()
+        except Exception:  # noqa: BLE001
+            position = 0
+
+        heading = f"[{title}]({uri})" if uri else f"**{title}**"
+        description = [heading]
+        if author:
+            description.append(f"-# {author}")
+
+        bar = self._progress_bar(position, 0 if is_stream else duration)
+        if is_stream:
+            description.append(f"\n{bar}")
+        else:
+            description.append(f"\n`{self._fmt(position)}` {bar} `{self._fmt(duration)}`")
+
+        embed = discord.Embed(
+            description="\n".join(description),
+            colour=await self.cog.bot.get_embed_colour(self.channel),
         )
+        embed.set_author(
+            name=_("Now playing in {guild}").format(guild=self.guild.name),
+            icon_url=self.guild.icon.url if self.guild.icon else None,
+        )
+        if artwork:
+            embed.set_thumbnail(url=artwork)
+
+        requester = self.cog.bot.get_user(getattr(track, "requester_id", 0))
+        embed.add_field(
+            name=_("Requested by"),
+            value=requester.mention if requester else _("Unknown"),
+            inline=True,
+        )
+        embed.add_field(name=_("Volume"), value=f"{player.volume}%", inline=True)
+
+        try:
+            repeat_current = await player.config.fetch_repeat_current()
+            repeat_queue = await player.config.fetch_repeat_queue()
+        except Exception:  # noqa: BLE001
+            repeat_current = repeat_queue = False
+        repeat = _("Track") if repeat_current else (_("Queue") if repeat_queue else _("Off"))
+        embed.add_field(name=_("Repeat"), value=repeat, inline=True)
+
+        raw = list(player.queue.raw_queue)
+        if raw:
+            upcoming = []
+            for nxt in raw[:3]:
+                try:
+                    upcoming.append(f"- {await nxt.title()}")
+                except Exception:  # noqa: BLE001
+                    continue
+            embed.add_field(
+                name=_("Up next ({count} queued)").format(count=len(raw)),
+                value="\n".join(upcoming) or _("Nothing"),
+                inline=False,
+            )
+        else:
+            embed.add_field(name=_("Up next"), value=_("Queue is empty"), inline=False)
+
+        channel = getattr(player, "channel", None)
+        if channel is not None:
+            embed.set_footer(text=_("Connected to {channel}").format(channel=channel.name))
+        return embed
 
     async def update_view(self, forced: bool = False):
         async with self.__update_view_lock:
