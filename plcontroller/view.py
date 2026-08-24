@@ -705,6 +705,59 @@ class RefreshButton(discord.ui.Button):
         await self.view.update_view()
 
 
+
+class ControllerDisconnectButton(discord.ui.Button):
+    """Disconnect, acting on the player directly.
+
+    PyLav's queue-view DisconnectButton calls `cog.command_disconnect`, which
+    only exists on PyLavPlayer - not on this cog - so it can't be reused here.
+    """
+
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
+        super().__init__(style=style, emoji=emojis.POWER, label=label, row=row, custom_id=custom_id)
+        self.cog = cog
+
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        player = self.cog.pylav.get_player(interaction.guild.id)
+        if player is None:
+            return
+        await player.disconnect(requester=interaction.user)
+        await self.view.update_view()
+
+
+class ControllerClearQueueButton(discord.ui.Button):
+    """Empty the queue without touching the current track."""
+
+    def __init__(
+        self,
+        cog: PyLavController,
+        style: discord.ButtonStyle,
+        row: int = None,
+        custom_id: str | None = None,
+        label: str | None = None,
+    ):
+        super().__init__(style=style, emoji=emojis.TRASH, label=label, row=row, custom_id=custom_id)
+        self.cog = cog
+
+    async def callback(self, interaction: DISCORD_INTERACTION_TYPE):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+        player = self.cog.pylav.get_player(interaction.guild.id)
+        if player is None:
+            return
+        player.queue.clear()
+        await self.view.update_view()
+
+
 class PersistentControllerView(discord.ui.View):
     def __init__(
         self,
@@ -754,7 +807,7 @@ class PersistentControllerView(discord.ui.View):
         )
         self.stop_button = StopTrackButton(
             style=TRANSPARENT,
-            row=1,
+            row=0,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:stop_button:12",
         )
@@ -774,39 +827,51 @@ class PersistentControllerView(discord.ui.View):
         )
         self.repeat_queue_button_on = ToggleRepeatQueueButton(
             style=TRANSPARENT,
-            row=2,
+            row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:repeat_queue_button_on:1",
         )
         self.repeat_button_on = ToggleRepeatButton(
             style=TRANSPARENT,
-            row=2,
+            row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:repeat_button_on:2",
         )
         self.repeat_button_off = ToggleRepeatButton(
             style=TRANSPARENT,
-            row=2,
+            row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:repeat_button_off:3",
         )
         self.queue_button = QueueButton(
             style=TRANSPARENT,
-            row=3,
+            row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:queue_button:14",
         )
         self.show_history_button = QueueHistoryButton(
             style=TRANSPARENT,
-            row=3,
+            row=1,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:show_history_button:4",
         )
 
         # Row 2 - utility
+        self.clear_queue_button = ControllerClearQueueButton(
+            style=TRANSPARENT,
+            row=2,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:clear_queue_button:15",
+        )
+        self.disconnect_button = ControllerDisconnectButton(
+            style=TRANSPARENT,
+            row=2,
+            cog=cog,
+            custom_id="pylav__pylavcontroller_persistent_view:disconnect_button:16",
+        )
         self.refresh_button = RefreshButton(
             style=TRANSPARENT,
-            row=3,
+            row=2,
             cog=cog,
             custom_id="pylav__pylavcontroller_persistent_view:refresh_button:13",
         )
@@ -940,8 +1005,10 @@ class PersistentControllerView(discord.ui.View):
             self.add_item(self.queue_button)
             self.add_item(self.show_history_button)
 
-            # Row 2 - utility
+            # Row 2 - utility (queue-view controls merged into the main view)
             self.add_item(self.refresh_button)
+            self.add_item(self.clear_queue_button)
+            self.add_item(self.disconnect_button)
 
             if player is None:
                 self.show_history_button.disabled = True
