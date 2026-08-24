@@ -6,6 +6,8 @@ import typing as t
 import discord
 from redbot.core import commands
 
+from pylav.players.query.obj import Query
+
 log = logging.getLogger("red.plcontroller.dashboard")
 
 
@@ -85,8 +87,57 @@ class DashboardIntegration:
         player = self._dash_player(guild)
 
         # --- handle an action, if one was submitted ---
-        form_data = (kwargs.get("data") or {}).get("form") or {}
-        action = form_data.get("action") if kwargs.get("method") == "POST" else None
+        # The webserver builds this with `request.form.to_dict(flat=False)`, so every
+        # value arrives as a list (e.g. {"action": ["pause"]}). Unwrap before comparing.
+        raw_form = (kwargs.get("data") or {}).get("form") or {}
+
+        def field(key: str, default=None):
+            value = raw_form.get(key, default)
+            if isinstance(value, (list, tuple)):
+                return value[0] if value else default
+            return value
+
+        action = field("action") if kwargs.get("method") == "POST" else None
+
+        # --- search: doesn't need an existing player ---
+        if action == "search":
+            search_term = (field("query") or "").strip()
+            if not search_term:
+                return {
+                    "status": 0,
+                    "notifications": [{"message": "Enter something to search for.", "category": "warning"}],
+                }
+            results, error = await self._dash_search(search_term)
+            if error:
+                return {"status": 0, "notifications": [{"message": error, "category": "danger"}]}
+            return {
+                "status": 0,
+                "web_content": {
+                    "source": PLAYER_TEMPLATE,
+                    "player_state": await self._dash_build_state(player),
+                    "search_results": results,
+                    "search_term": search_term,
+                    "csrf_token_value": (kwargs.get("csrf_token") or ("", ""))[1],
+                },
+            }
+
+        # --- play / enqueue: connects if needed ---
+        if action in ("play", "play_now"):
+            identifier = (field("identifier") or field("query") or "").strip()
+            if not identifier:
+                return {
+                    "status": 0,
+                    "notifications": [{"message": "Nothing to play.", "category": "warning"}],
+                }
+            message, category = await self._dash_play(
+                member, guild, player, identifier, play_now=(action == "play_now")
+            )
+            return {
+                "status": 0,
+                "notifications": [{"message": message, "category": category}],
+                "redirect_url": kwargs.get("request_url"),
+            }
+
         if action:
             if player is None:
                 return {
@@ -116,8 +167,25 @@ class DashboardIntegration:
                 elif action == "volume_down":
                     await player.set_volume(max(player.volume - 5, 0), member)
                 elif action == "volume_set":
-                    raw = form_data.get("volume")
+                    raw = field("volume")
                     await player.set_volume(max(0, min(int(raw), 1000)), member)
+                elif action == "seek":
+                    # form sends seconds; PyLav wants milliseconds
+                    await player.seek(float(field("position") or 0) * 1000, member)
+                elif action == "repeat_track":
+                    # Repeat state lives in async config, not a plain attribute.
+                    current = await player.config.fetch_repeat_current()
+                    await player.set_repeat("current", not current, member)
+                elif action == "repeat_queue":
+                    current = await player.config.fetch_repeat_queue()
+                    await player.set_repeat("queue", not current, member)
+                elif action == "repeat_off":
+                    await player.set_repeat("disable", False, member)
+                elif action == "clear_queue":
+                    player.queue.clear()
+                elif action == "remove_track":
+                    # popindex() is PlayerQueue's supported positional removal.
+                    player.queue.popindex(int(field("index")))
                 else:
                     return {
                         "status": 0,
@@ -145,6 +213,8 @@ class DashboardIntegration:
                 "player_state": await self._dash_build_state(player),
                 # kwargs["csrf_token"] is (raw, signed); the signed value goes in the form.
                 "csrf_token_value": (kwargs.get("csrf_token") or ("", ""))[1],
+                "search_results": [],
+                "search_term": "",
             },
         }
 
@@ -209,6 +279,111 @@ class DashboardIntegration:
         return state
 
 
+    # ---------- search / play helpers ----------
+
+    async def _dash_search(self, search_term: str, limit: int = 10):
+        """Returns (results, error_message). Results are plain dicts for the template."""
+        try:
+            query = await Query.from_string(search_term)
+            response = await self.pylav.search_query(query)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Dashboard search failed for %r", search_term)
+            return [], f"Search failed: {exc}"
+
+        if response is None:
+            return [], "No response from the audio node."
+
+        load_type = getattr(response, "loadType", None)
+        data = getattr(response, "data", None)
+
+        if load_type == "error":
+            return [], f"Search error: {getattr(data, 'message', 'unknown error')}"
+        if load_type == "empty" or data is None:
+            return [], None
+
+        if load_type == "search":
+            tracks = list(data)
+        elif load_type == "playlist":
+            tracks = list(getattr(data, "tracks", []))
+        elif load_type == "track":
+            tracks = [data]
+        else:
+            tracks = []
+
+        results = []
+        for track in tracks[:limit]:
+            info = getattr(track, "info", None)
+            if info is None:
+                continue
+            results.append(
+                {
+                    "title": getattr(info, "title", None) or "Unknown title",
+                    "author": getattr(info, "author", None) or "",
+                    "duration": _fmt_ms(getattr(info, "length", 0)),
+                    "uri": getattr(info, "uri", None) or "",
+                    "identifier": getattr(info, "uri", None) or "",
+                    "artwork": getattr(info, "artworkUrl", None) or "",
+                    "stream": bool(getattr(info, "isStream", False)),
+                }
+            )
+        return results, None
+
+    async def _dash_play(self, member, guild, player, identifier: str, play_now: bool = False):
+        """Enqueue (or immediately play) a query/URL. Returns (message, category)."""
+        # Connect if we have no player yet - the requester must be in a voice channel.
+        if player is None:
+            voice_state = getattr(member, "voice", None)
+            channel = getattr(voice_state, "channel", None)
+            if channel is None:
+                return ("Join a voice channel first, then try again.", "warning")
+            try:
+                player = await self.pylav.player_manager.create(channel=channel, requester=member)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Dashboard could not create a player")
+                return (f"Could not connect: {exc}", "danger")
+
+        try:
+            query = await Query.from_string(identifier)
+            response = await self.pylav.get_tracks(query, player=player)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Dashboard could not resolve %r", identifier)
+            return (f"Could not resolve that: {exc}", "danger")
+
+        load_type = getattr(response, "loadType", None)
+        data = getattr(response, "data", None)
+
+        if load_type == "error":
+            return (f"Load error: {getattr(data, 'message', 'unknown error')}", "danger")
+        if load_type == "empty" or data is None:
+            return ("Nothing found for that query.", "warning")
+
+        if load_type == "playlist":
+            tracks = list(getattr(data, "tracks", []))
+        elif load_type == "search":
+            tracks = list(data)[:1]
+        else:
+            tracks = [data]
+
+        if not tracks:
+            return ("Nothing found for that query.", "warning")
+
+        try:
+            if play_now or not player.current:
+                await player.play(tracks[0], query, member)
+                extra = tracks[1:]
+            else:
+                extra = tracks
+            for track in extra:
+                await player.add(requester=member.id, track=track, query=query)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Dashboard playback failed")
+            return (f"Playback failed: {exc}", "danger")
+
+        if len(tracks) > 1:
+            return (f"Added {len(tracks)} tracks to the queue.", "success")
+        return ("Added to the queue." if not play_now else "Now playing.", "success")
+
+
 PLAYER_TEMPLATE = """
 <style>
   .plc-wrap { display: flex; flex-direction: column; gap: 16px; }
@@ -252,12 +427,86 @@ PLAYER_TEMPLATE = """
   }
   .plc-queue th { opacity: 0.6; font-size: 0.74rem; text-transform: uppercase; }
   .plc-empty { opacity: 0.65; padding: 24px; text-align: center; }
+  .plc-panels { display: grid; gap: 16px; grid-template-columns: 1fr; margin-top: 4px; }
+  @media (min-width: 1100px) { .plc-panels { grid-template-columns: 3fr 2fr; } }
+  .plc-panel {
+    padding: 16px; border-radius: 12px;
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
+  }
+  .plc-panel h5 { margin: 0 0 4px 0; font-size: 1rem; }
+  .plc-hint { opacity: 0.6; font-size: 0.8rem; margin: 0 0 10px 0; }
+  .plc-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .plc-label { font-size: 0.78rem; opacity: 0.7; }
+  .plc-input {
+    flex: 1 1 240px; min-width: 0; height: 42px; padding: 0 12px;
+    border-radius: 10px; background: rgba(0,0,0,0.25);
+    border: 1px solid rgba(255,255,255,0.12); color: inherit; font-size: 0.9rem;
+  }
+  .plc-input:focus { outline: none; border-color: rgba(255,255,255,0.3); }
 </style>
 
 {% if not player_state.connected %}
   <div class="plc-empty">
     <h4>Not connected</h4>
-    <p>The bot is not currently in a voice channel on this server.</p>
+    <p>Join a voice channel and play something below - I'll connect automatically.</p>
+  </div>
+
+  <div class="plc-panels">
+
+    <div class="plc-panel">
+      <h5>Search &amp; play</h5>
+      <p class="plc-hint">Search YouTube (and every other source your nodes support), then queue a result.</p>
+      <form method="POST" class="plc-row">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+        <input class="plc-input" type="text" name="query" placeholder="Search for a song, artist, or paste a link..."
+               value="{{ search_term or '' }}" />
+        <button class="plc-btn primary" name="action" value="search">Search</button>
+      </form>
+
+      {% if search_results %}
+        <table class="plc-queue" style="margin-top:12px;">
+          <thead><tr><th></th><th>Title</th><th>Artist</th><th>Length</th><th></th></tr></thead>
+          <tbody>
+            {% for r in search_results %}
+              <tr>
+                <td style="width:52px;">
+                  {% if r.artwork %}<img src="{{ r.artwork }}" alt="" style="width:44px;height:44px;border-radius:6px;object-fit:cover;" />{% endif %}
+                </td>
+                <td>{% if r.uri %}<a href="{{ r.uri }}" target="_blank">{{ r.title }}</a>{% else %}{{ r.title }}{% endif %}</td>
+                <td>{{ r.author }}</td>
+                <td>{% if r.stream %}LIVE{% else %}{{ r.duration }}{% endif %}</td>
+                <td style="white-space:nowrap;">
+                  <form method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+                    <input type="hidden" name="identifier" value="{{ r.identifier }}" />
+                    <button class="plc-btn" name="action" value="play" title="Add to queue">+ Queue</button>
+                  </form>
+                  <form method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+                    <input type="hidden" name="identifier" value="{{ r.identifier }}" />
+                    <button class="plc-btn primary" name="action" value="play_now" title="Play immediately">&#9654;</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% elif search_term %}
+        <p class="plc-empty">No results for &ldquo;{{ search_term }}&rdquo;.</p>
+      {% endif %}
+    </div>
+
+    <div class="plc-panel">
+      <h5>Radio / direct stream</h5>
+      <p class="plc-hint">Paste a direct stream or radio URL (Icecast/Shoutcast, .mp3, .m3u8, and so on).</p>
+      <form method="POST" class="plc-row">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+        <input class="plc-input" type="text" name="identifier" placeholder="https://stream.example.com/live.mp3" />
+        <button class="plc-btn" name="action" value="play">Queue</button>
+        <button class="plc-btn primary" name="action" value="play_now">Play now</button>
+      </form>
+    </div>
+
   </div>
 {% else %}
   <div class="plc-wrap">
@@ -299,6 +548,21 @@ PLAYER_TEMPLATE = """
       <button class="plc-btn danger" name="action" value="disconnect" title="Disconnect">Disconnect</button>
     </form>
 
+    <form method="POST" class="plc-controls">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+      <button class="plc-btn" name="action" value="repeat_track" title="Repeat current track">&#128257; Repeat track</button>
+      <button class="plc-btn" name="action" value="repeat_queue" title="Repeat queue">&#128256; Repeat queue</button>
+      <button class="plc-btn" name="action" value="repeat_off" title="Turn repeat off">Repeat off</button>
+      <button class="plc-btn danger" name="action" value="clear_queue" title="Empty the queue">Clear queue</button>
+    </form>
+
+    <form method="POST" class="plc-vol">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+      <label class="plc-label" for="plcSeek">Seek to (seconds)</label>
+      <input class="plc-input" style="max-width:120px;" id="plcSeek" type="number" name="position" min="0" step="1" value="0" />
+      <button class="plc-btn" name="action" value="seek">Go</button>
+    </form>
+
     <form method="POST" class="plc-vol">
       <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
       <button class="plc-btn" name="action" value="volume_down" title="Volume down">&#8722;</button>
@@ -314,7 +578,7 @@ PLAYER_TEMPLATE = """
       {% if player_state.queue %}
         <table class="plc-queue">
           <thead>
-            <tr><th>#</th><th>Title</th><th>Artist</th><th>Length</th></tr>
+            <tr><th>#</th><th>Title</th><th>Artist</th><th>Length</th><th></th></tr>
           </thead>
           <tbody>
             {% for item in player_state.queue %}
@@ -323,6 +587,13 @@ PLAYER_TEMPLATE = """
                 <td>{% if item.uri %}<a href="{{ item.uri }}" target="_blank">{{ item.title }}</a>{% else %}{{ item.title }}{% endif %}</td>
                 <td>{{ item.author }}</td>
                 <td>{{ item.duration }}</td>
+                <td style="width:1%;white-space:nowrap;">
+                  <form method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+                    <input type="hidden" name="index" value="{{ loop.index0 }}" />
+                    <button class="plc-btn danger" name="action" value="remove_track" title="Remove">&times;</button>
+                  </form>
+                </td>
               </tr>
             {% endfor %}
           </tbody>
@@ -334,6 +605,64 @@ PLAYER_TEMPLATE = """
         <p class="plc-empty">The queue is empty.</p>
       {% endif %}
     </div>
+
+  <div class="plc-panels">
+
+    <div class="plc-panel">
+      <h5>Search &amp; play</h5>
+      <p class="plc-hint">Search YouTube (and every other source your nodes support), then queue a result.</p>
+      <form method="POST" class="plc-row">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+        <input class="plc-input" type="text" name="query" placeholder="Search for a song, artist, or paste a link..."
+               value="{{ search_term or '' }}" />
+        <button class="plc-btn primary" name="action" value="search">Search</button>
+      </form>
+
+      {% if search_results %}
+        <table class="plc-queue" style="margin-top:12px;">
+          <thead><tr><th></th><th>Title</th><th>Artist</th><th>Length</th><th></th></tr></thead>
+          <tbody>
+            {% for r in search_results %}
+              <tr>
+                <td style="width:52px;">
+                  {% if r.artwork %}<img src="{{ r.artwork }}" alt="" style="width:44px;height:44px;border-radius:6px;object-fit:cover;" />{% endif %}
+                </td>
+                <td>{% if r.uri %}<a href="{{ r.uri }}" target="_blank">{{ r.title }}</a>{% else %}{{ r.title }}{% endif %}</td>
+                <td>{{ r.author }}</td>
+                <td>{% if r.stream %}LIVE{% else %}{{ r.duration }}{% endif %}</td>
+                <td style="white-space:nowrap;">
+                  <form method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+                    <input type="hidden" name="identifier" value="{{ r.identifier }}" />
+                    <button class="plc-btn" name="action" value="play" title="Add to queue">+ Queue</button>
+                  </form>
+                  <form method="POST" style="display:inline;">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+                    <input type="hidden" name="identifier" value="{{ r.identifier }}" />
+                    <button class="plc-btn primary" name="action" value="play_now" title="Play immediately">&#9654;</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% elif search_term %}
+        <p class="plc-empty">No results for &ldquo;{{ search_term }}&rdquo;.</p>
+      {% endif %}
+    </div>
+
+    <div class="plc-panel">
+      <h5>Radio / direct stream</h5>
+      <p class="plc-hint">Paste a direct stream or radio URL (Icecast/Shoutcast, .mp3, .m3u8, and so on).</p>
+      <form method="POST" class="plc-row">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token_value }}" />
+        <input class="plc-input" type="text" name="identifier" placeholder="https://stream.example.com/live.mp3" />
+        <button class="plc-btn" name="action" value="play">Queue</button>
+        <button class="plc-btn primary" name="action" value="play_now">Play now</button>
+      </form>
+    </div>
+
+  </div>
 
   </div>
 {% endif %}
