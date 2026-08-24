@@ -16,6 +16,7 @@ from redbot.core.i18n import Translator, cog_i18n
 from redbot.core.utils.antispam import AntiSpam
 from redbot.core.utils.chat_formatting import humanize_number
 
+from plcontroller.dashboard_integration import DashboardIntegration
 from plcontroller.view import PersistentControllerView
 from pylav import logging
 from pylav.core.context import PyLavContext
@@ -34,6 +35,7 @@ LOGGER = logging.getLogger("red.PyLav.cog.Controller")
 
 @cog_i18n(_)
 class PyLavController(
+    DashboardIntegration,
     DISCORD_COG_TYPE_MIXIN,
 ):
     """Set a channel to listens and control the music player."""
