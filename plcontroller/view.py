@@ -17,6 +17,10 @@ from pylav.type_hints.bot import DISCORD_INTERACTION_TYPE
 
 _ = Translator("PyLavController", Path(__file__))
 
+# Bump this whenever view.py changes. Check what the bot actually loaded with:
+#   [p]eval import plcontroller.view as v; print(v.__view_version__)
+__view_version__ = "2026.08.14.3-public-queue-menu"
+
 # Discord has no true "transparent" button; secondary/grey is the neutral style
 # that blends into the message background. Change this in one place to restyle
 # the whole controller.
